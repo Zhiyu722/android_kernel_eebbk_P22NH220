@@ -1,0 +1,114 @@
+[PATCH 4/4] ASoC: sm6150: use the AW882xx speaker codec, not TFA98xx
+
+*** THIS IS THE SECOND HALF OF THE SOUND FIX ***
+
+populate_snd_card_dailinks() contained a local hack that forced the legacy
+single-codec fields of the two MI2S backend links to TFA98xx:
+
+    msm_mi2s_be_dai_links[0].codec_name     = "tfa98xx.2-0034";
+    msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
+    msm_mi2s_be_dai_links[1].codec_name     = "tfa98xx.2-0036";
+    msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
+
+The EEBBK S6 (P20H130) does not use TFA98xx.  Its two speaker amplifiers on
+i2c 2-0034 / 2-0036 are AWINIC AW882xx parts, and the aw882xx driver probes
+them successfully:
+
+    [Awinic][2-0034]aw882xx_read_chipid: aw882xx 1852 detected
+    [Awinic][2-0034]aw882xx_dai_drv_append_suffix: dai name [aw882xx-aif-2-34]
+    [Awinic][2-0036]... (second amplifier, same story)
+
+Because snd_soc_init_multicodec() (sound/soc/soc-core.c) treats any non-NULL
+legacy codec field as "single codec link":
+
+    if (dai_link->codec_name || dai_link->codec_of_node ||
+        dai_link->codec_dai_name) {
+            dai_link->num_codecs = 1;
+            dai_link->codecs[0].name     = dai_link->codec_name;
+            dai_link->codecs[0].dai_name = dai_link->codec_dai_name;
+    }
+
+those four assignments discarded the correct awinic component table
+(awinic_codecs[] = { "aw882xx_smartpa.2-0034" / "aw882xx-aif-2-34",
+                     "aw882xx_smartpa.2-0036" / "aw882xx-aif-2-36" },
+already selected by the #elif defined CONFIG_SND_SOC_AWINIC_AW882XX branch
+right above) and replaced it with a DAI that does not exist on this board.
+The result was a permanent failure:
+
+    sm6150-asoc-snd ...: ASoC: CODEC DAI tfa98xx-aif-2-34 not registered
+    -> snd_soc_register_card() returns -EPROBE_DEFER forever
+    -> no sound card is ever created
+    -> the vendor audio HAL dies in get_sndcard_id()
+    -> audioserver never publishes media.audio_policy
+    -> the device hangs on the boot animation (second screen)
+
+Evidence that this hack is not what the factory kernel does: the factory
+machine driver module (extracted from super_5.img, name=machine_dlkm) has no
+"dual speaker configured (34 & 36)" string at all, and its symbol table has
+
+    aw882xx_dails   48 bytes = 2 x sizeof(struct snd_soc_dai_link_component)
+    tfa98xx_dails   48 bytes
+    fs16xx_codecs   24 bytes
+
+i.e. the factory driver always supplies the codecs through the component
+table (.codecs / .num_codecs), never through the legacy single-codec fields.
+
+Fix: drop the four assignments and let the link table supply the AW882xx
+components.  Verified on hardware afterwards:
+
+    sys.boot_completed = 1
+    /sys/class/sound/card0 exists (23 PCM playback devices + 12 compress)
+    audio_hw_utils: audio_extn_utils_open_snd_mixer: snd_card_name: sm6150-wcd9375-snd-card
+    audio_hw_utils: audio_extn_utils_open_snd_mixer: Opened sound card:0
+    AudioFlinger: output thread -> Output devices: 0x2 (AUDIO_DEVICE_OUT_SPEAKER)
+--- a/techpack/audio/asoc/sm6150.c
++++ b/techpack/audio/asoc/sm6150.c
+@@ -8555,16 +8555,38 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev)
+ 				__func__);
+ 		} else {
+ 			if (mi2s_audio_intf) {
+-
+-    // 第一个 link（通常是左声道）
+-                msm_mi2s_be_dai_links[0].codec_name = "tfa98xx.2-0034";
+-                msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
+-
+-                // 第二个 link（右声道）
+-                msm_mi2s_be_dai_links[1].codec_name = "tfa98xx.2-0036";
+-                msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
+-
+-                dev_info(dev, "%s: dual speaker configured (34 & 36)\n", __func__);
++				/*
++				 * EEBBK S6 (P20H130 / sdmmagpiep): the two speaker
++				 * amplifiers on i2c 2-0034 and 2-0036 are AWINIC
++				 * AW882xx parts, not TFA98xx.  The aw882xx driver
++				 * probes both (dmesg: "[Awinic][2-0034]aw882xx
++				 * 1852 detected") and registers the DAIs
++				 * "aw882xx-aif-2-34" / "aw882xx-aif-2-36" with the
++				 * components "aw882xx_smartpa.2-0034" /
++				 * "aw882xx_smartpa.2-0036".
++				 *
++				 * The previous code forced the legacy single-codec
++				 * fields to "tfa98xx*" here.  That makes
++				 * snd_soc_init_multicodec() collapse each link to one
++				 * codec (num_codecs = 1) pointing at a DAI that does
++				 * not exist on this board, so
++				 * snd_soc_register_card() returns -EPROBE_DEFER
++				 * forever:
++				 *   "ASoC: CODEC DAI tfa98xx-aif-2-34 not registered"
++				 * No sound card is ever created, the vendor audio HAL
++				 * dies in get_sndcard_id(), audioserver never
++				 * publishes media.audio_policy and the device hangs on
++				 * the boot animation.
++				 *
++				 * Leave the legacy fields NULL and let the link table
++				 * above supply the AW882xx components
++				 * (.codecs = awinic_codecs, .num_codecs = 2 under
++				 * CONFIG_SND_SOC_AWINIC_AW882XX) - this is what the
++				 * factory machine_dlkm.ko does (its symbol table has
++				 * "aw882xx_dails", 48 bytes = 2 dai_link_components).
++				 */
++				dev_info(dev, "%s: dual AW882xx speakers configured (2-0034 & 2-0036)\n",
++					 __func__);
+ 
+ 				memcpy(msm_sm6150_dai_links + total_links,
+ 					msm_mi2s_be_dai_links,
