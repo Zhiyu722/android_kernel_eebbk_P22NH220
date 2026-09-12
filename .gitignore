@@ -132,3 +132,6 @@ kernel/configs/android-*.cfg
 Android.bp
 out/
 out_*/
+
+# keep the kernel release pinned to 4.14.190-perf
+!.scmversion
