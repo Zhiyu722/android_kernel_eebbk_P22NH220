@@ -123,14 +123,91 @@ reg[0x0703] = 0xff, ...
 
 ---
 
-## 三、构建
+### 3. `arch/arm64/kernel/vmlinux.lds.S`（链接布局修复，必须）
 
-```bash
-# 在 WSL/Linux 里（clang-11、ld.lld、dtc、bison、flex、libssl-dev、bc 已装）
-cd android_kernel_eebbk_sm6150
-./build_eebbk_clang11.sh
-# 产物：out/arch/arm64/boot/Image.gz  （vermagic 4.14.190-perf）
+厂商脚本里 `.bss.rtic`（`__rticdata`，含 `selinux_state`）被放在
+`STABS_DEBUG`（`.stab 0 : {...}` 显式地址 0 的调试段）之后：
+
+* 当年的 binutils 2.27 会把同名 `.bss` 合并进镜像，所以没问题；
+* 现代链接器（GNU ld 2.38 / LLVM lld 11）要么报
+  `relocation R_AARCH64_ADR_PREL_PG_HI21 out of range`（段被放到地址 ≈0），
+  要么把段放到 `_end` 之后。
+
+**真机实测**：第一版修复（段放在 `_end` 之后）刷入后**卡在第一屏无法开机**。
+用 `nm` 检查符号地址确认了根因：
+
 ```
+__bss_stop       = ffffff800a1e9560
+__bss_rtic_start = ffffff800a1f1000
+_end             = ffffff800a1f1000   <-- RTIC 段正好在 _end 之外
+selinux_state    = ffffff800a1f1000   <-- 会被页分配器复用并覆盖
+```
+
+内核只保留 `_text.._end` 的内存，`selinux_state` 落在保留区之外 → 启动即崩溃。
+最终修法：把 `.bss.rtic` 放在 `BSS_SECTION(0, 0, 0)` 之后、`_end` 之前
+（镜像内部、页对齐），修复后：
+
+```
+__bss_rtic_start = ffffff800a1ea000
+selinux_state    = ffffff800a1ea000   <-- 在 _end 之内
+_end             = ffffff800a1f2000
+```
+
+刷入后设备正常开机（`Linux version 4.14.190-perf+ ... clang version 11.1.0-6, LLD 11.1.0`）。
+
+### 4. `.scmversion`（vermagic 修复，必须）
+
+源码树里存在 `.git` 时，`scripts/setlocalversion` 会给出 `4.14.190-perf+`，
+而厂商 DLKM 模块记录的是 `4.14.190-perf`，**vermagic 不匹配会导致全部厂商模块
+拒绝加载**（实测：`lsmod` 只有 1 行、`sys.boot_completed` 一直为空、无声音）。
+
+修法：在源码根目录放一个空的 `.scmversion`（本仓库已包含），
+`make kernelrelease` 即回到 `4.14.190-perf`，与厂商模块一致。
+（用本仓库 `.github/workflows/build.yml` 的 CI 方式构建时没有 `.git`，不受影响。）
+
+---
+
+## 三、真机验证结果（adb / fastboot）
+
+设备：EEBBK S6（`ro.boot.serialno=2fa7c794`，Android 11，非 A/B，boot 分区 64MB）
+
+| 检查项 | 原厂内核 | 本仓库修复后（实测） |
+|---|---|---|
+| 内核启动 | ✓ | ✓（clang 11 + lld，`4.14.190-perf`） |
+| `/proc/driver/BackCamera_info` | 存在 | **存在** ✓ |
+| `/proc/driver/FrontCamera_info` | 存在 | **存在** ✓ |
+| 节点内容 | `Module Vendor: Q Tech (2742EJ36Q0F002DT),…` | 同格式（见第二节还原依据） |
+| `dumpsys media.camera` 相机数 | 2 | **1（仅后摄）** ⚠ 前摄需要原厂私有 sensor 代码 |
+| 厂商音频 DLKM | 33 个已加载，`aw882xx_dlkm` 工作中 | **未加载**（`lsmod` 仅 1 行）⚠ |
+| `sys.boot_completed` | 1 | 空（卡开机动画）⚠ |
+| 升降/霍尔等 BBK 节点 | 有驱动 | 只有 DT 里的 platform device，无驱动 ⚠ |
+
+### 当前阻塞点：厂商 DLKM 仍不加载
+
+vermagic 修正后（`4.14.190-perf`，与原厂一致）模块仍未加载，表现为
+`lsmod` 只有 1 行、`sys.boot_completed` 为空、停在开机动画（“第二屏”）。
+可能原因与下一步：
+
+1. `CONFIG_MODVERSIONS=y`（本内核与原厂一致）会对模块做符号 CRC 校验；
+   我们的源码缺 BBK 私有驱动、编译链也不同，CRC 可能不一致
+   → 试 `CONFIG_MODVERSIONS=n` 重新构建（内核侧关闭 CRC 校验，模块侧 vermagic 仍匹配）；
+2. 需要 `dmesg`（当前无 root，Magisk 因多次失败启动进入保护状态）确认
+   具体报错是 `disagrees about version of symbol` 还是 `Unknown symbol`；
+3. 若为 `Unknown symbol`，说明模块依赖原厂私有驱动导出的符号，
+   那就必须补齐 BBK 源码才能继续。
+
+刷机要点（实测）：
+
+* 本机 **只有在 fastbootd 模式下** `fastboot flash boot` 才被接受
+  （bootloader 模式返回 `unknown command` / `Unrecognized command download`）；
+* fastbootd 下设备序列号为 `2fa7c794`；recovery/fastbootd 等模式下 adb 序列号
+  可能显示为 `0123456789ABCDEF`（**据此判断当前模式，也避免刷错设备**）；
+* 原厂 `imgdata/boot.img` 可直接刷回恢复。
+
+> 提醒：本仓库源码缺少 BBK 私有驱动，因此自编译内核在真机上会
+> 丢失升降前摄/霍尔/传感器/ramext 等功能，且可能无法让原厂 userspace 完整启动。
+> 若目标只是“可用的自定义内核”，建议先拿到完整原厂源码树再动内核。
+
 
 ## 四、已知未覆盖项（源码本身缺失，非本次改动引入）
 
