@@ -1,6 +1,6 @@
 # s6patch霍尔 — EEBBK S6 (P20H130) 霍尔传感器 / 升降摄像头子系统
 
-状态：**逆向与重写进行中**（① IST8801 与 ② MXM1120 驱动已落地并编译通过，③④ 待写）
+状态：**逆向完成，重写进行中**（① IST8801、② MXM1120、④ 升降电机 vib_pwm 已落地并编译通过；③ bbk_hall_core 已完整逆向、待写）
 
 ## 一、问题：四个私有驱动在源码里完全不存在
 
@@ -263,10 +263,54 @@ bbk_hall_cali_time
 ## 七、进度
 
 | 步骤 | 内容 | 状态 |
-|---|---|---|
+|---|---|---|---|
 | ① | `ist8801` 传感器驱动（寄存器映射已还原） | **已编译通过**，待真机确认节点/读数 |
-| ② | `mxm1120` 传感器驱动（up/down 两实例，协议+解码已还原） | **已编译通过、已提交**，待真机确认节点/读数 |
-| ③ | BBK 霍尔框架（misc + sysfs + 校准 + 队列） | 待写（ioctl 名与持久化路径已探明） |
-| ④ | `vib_pwm` 升降电机（GPIO+GP2 时钟 + 状态机） | 待写（硬件与用户态接口已抓全） |
+| ② | `mxm1120` 传感器驱动（up/down 两实例） | **已编译通过、已提交** |
+| ③ | BBK 霍尔框架 `bbk_hall_core` | **已完整逆向**（见 `bbk_hall_core-逆向报告.md`），驱动待写 |
+| ④ | `vib_pwm` 升降电机（GPIO + GP2 时钟 + 状态机 + input 键） | **已编译通过、已提交** |
+
+## 八、详细逆向报告
+
+两份逐指令级的逆向报告随本目录一起提交：
+
+- `vib_pwm-逆向报告.md` —— 升降电机控制器：680 字节私有数据结构逐字段偏移、
+  15 个 sysfs 属性的 show/store 伪 C、camera_state 状态机完整迁移表（0/1/2/4/5/6/7）、
+  电机启停时序、时间量纲与三档频率（19200/32000/41600/4800）、
+  模块参数 `gpio_pwm.mhall_control*` 的名称与默认值、
+  `h110-vib-input` 的键 635..646、以及 20 条"抄错就不工作"的坑。
+- `bbk_hall_core-逆向报告.md` —— 霍尔框架：misc 设备 `/dev/bbk_hall_core`、
+  ioctl `0x40046000/1/2/3` 的完整语义、标定文件 `cali_hall`（56 B）与
+  `cali_mhall_final`（48 B）的裸结构布局、6 个 sysfs 属性、
+  `mhall_data` 结构、导出 API 清单与 `struct hall_dev` 注册协议、
+  位置插值算法（0/3828/7656/11101/15950 五锚点）。
+
+### 本轮新确认的关键事实
+
+1. 升降电机**不是 PWM**：驱动波形就是 `gcc_gp2_clk`（`clocks=<&gcc 36>`，
+   `clock-names="gp2_clk"`），`clk_set_rate` 直接决定斩波频率；
+   由 `vib_pwm_active` 这个 pinctrl 状态把 GPIO21 复用成 `gcc_gp2` 输出。
+2. `camera_state` 不止 0/1/2：`4`=上行中、`5`=下行中（忙态，
+   `set_camera` 会因 `(state & ~1) == 4` 拒绝新命令）、
+   `6`=被防夹逻辑停在异常态、`7`=holder 保持位（介于 1 与 2 之间）。
+   **收尾时必须把 `camera_state` 写成 target**，否则永久忙。
+3. 行程时间：`all_time`（模块参数 `mhall_control7`，默认 **2839**）为满行程，
+   69.6% 位取 `all_time*696/1000`，主驱动段统一再乘 `6/10`
+   （19200 Hz 标称 → 32000 Hz 实际）；`time > 65536` 时先跑 50 ms 预驱动段，
+   再以 41600 Hz 跑余下 `(time-50)*6/13`。
+4. `abort_notify` 是**字符串关键字协议**（`"0x27c"/"636"`、`"0x27d"/"637"`、
+   `"0x27f"/"639"`、`"0x280"/"640"`、`"0x282"/"642"`、`"0x283"/"643"`、
+   `"0x284"/"644"`、`"666"`、`"888"`、`"stream on/off"`、
+   `"username:"`、`"com.eebbk.askhomework"`），不是数字。
+5. 驱动还会注册 input 设备 **`h110-vib-input`**（`h110-vib/input0`，
+   bustype 0x19）并注入键 **635..646**（按下+SYN、抬起+SYN），
+   Android 侧依赖它判断升降机构状态。
+6. `bbk_hall_core` 的 misc 名是 `bbk_hall_core`（`/dev/bbk_hall_core`），
+   ioctl 基址 `0x40046000` 四条；传感器通过
+   `struct hall_dev { char name[24]; ops*; void *data; }` 注册，
+   名字前两/四字节必须是 `up`/`down`。
+7. 平台设备 `bbk_hall_core` **没有 compatible**，靠平台设备名匹配；
+   设备是在上下两路霍尔都注册成功后才由 core 自己注册的。
+8. `data-range` / `hall,bias_support` / `hall,bias-ratio` 不是框架属性，
+   而是 IST8801 传感器驱动自己解析的。
 
 每步单独提交、单独编译，都能给出可刷镜像。
