@@ -11,7 +11,11 @@
 
 ## 一、根因
 
-### 1. 无声：音频栈被编进内核，与厂商 DLKM 模块冲突
+### 1. 无声：`TECHPACK=n` 把 ADSP loader 挡在了内核之外
+
+> **更正**：本文档早期版本把根因写成「音频栈被编进内核、与厂商 DLKM 冲突」，
+> 那是错的。真机实测证明恰恰相反：**把音频栈编进内核才是修复**，
+> 而「不编」（`TECHPACK=n`）正是无声的原因。
 
 真机 `/vendor/lib/modules` 下有 **44 个厂商内核模块**，其中音频框架全部是模块：
 
@@ -21,24 +25,143 @@ audio_machine_talos.ko  audio_q6.ko   audio_platform.ko ... (33 个音频模块)
 qca_cld3_wlan.ko   wil6210.ko  br_netfilter.ko  lcd.ko  llcc_perfmon.ko ...
 ```
 
-真机 `lsmod`（原厂内核运行时）确认这些模块**正在工作**，功放 `aw882xx_dlkm`
-引用计数为 3，`/proc/asound/cards` 有 `sm6150-wcd9375-snd-card`。
+原厂内核镜像里 **没有任何音频字符串**（`aw882xx/wcd937x/bolero` 计数均为 0），
+原厂确实是按 DLKM 方式构建的。**但这套 DLKM 在本仓库编出的内核上用不了**：
+它们是用厂商内核链接的，`struct module` / 符号 CRC 与本内核不兼容
+（实测 `module_layout` 期望 `0xcc8cac52`，本内核算出 `0x021f9ae4`）。
 
-而本仓库默认构建方式（`.github/workflows/build.yml`：
-`make O=out CC=clang vendor/sdmsteppe-perf_defconfig h130.config`）会把
-`techpack/audio` **编进内核镜像**：
+于是本内核必须自带一份 **ABI 自洽** 的音频栈。而早期构建脚本传了 `TECHPACK=n`：
 
-* `techpack/audio/Makefile` 在 `CONFIG_ARCH_SM6150/ARCH_SDMMAGPIE=y` 时
-  无条件 `include techpack/audio/config/sm6150auto.conf` 并 `export`，
-  该文件把 `CONFIG_SND_SOC_WCD937X=y`、`CONFIG_SND_SMARTPA_AW882XX=y` 等
-  全部置 `y`；
-* `techpack/Kbuild` 用 `TECHPACK?=y` 把 `techpack/audio` 挂进 `obj-y`。
+```make
+# techpack/Kbuild
+TECHPACK?=y
+obj-${TECHPACK} += stub/ $(addsuffix /,$(subst $(srctree)/techpack/,,$(techpack-dirs)))
+```
 
-结果：内核里有一份完整的 QCOM 音频栈，厂商的 `audio_*.ko` 加载失败
-（驱动/i2c 设备重复注册），音频 HAL 拿不到声卡 → **无声**。
+传 `n` 就只编 `stub/`。实测两种构建的内核里 techpack 目标文件数：
 
-原厂内核镜像里 **没有任何音频字符串**（`aw882xx/wcd937x/bolero/msm-pcm-routing`
-计数均为 0），证明原厂就是按 DLKM 方式构建的。
+| 构建 | `out/techpack` 下目标文件 | 结果 |
+|---|---|---|
+| `TECHPACK=n`（旧，错误） | **1 个**（空的 `techpack/built-in.o`） | 音频代码为 0，**无声卡，卡开机动画** |
+| `TECHPACK=y`（修复） | **87+ 个**（`asoc/` `dsp/` `ipc/` …） | 音频栈齐全 |
+
+**决定性的一环是 ADSP loader。** `techpack/audio/config/sm6150auto.conf`
+（由 `techpack/audio/Makefile` 在 `CONFIG_ARCH_SM6150=y` 时强制 include 并 export）
+里有 `CONFIG_MSM_ADSP_LOADER=y`，对应的
+`techpack/audio/dsp/adsp-loader.c` 是**唯一**会去拉起 ADSP 的代码：
+
+```c
+/* DT 里 qcom,adsp-state = <0>，且没有 qcom,proc-img-to-load → 走 load_adsp */
+adsp_state = apr_get_q6_state();
+if (adsp_state == APR_SUBSYS_DOWN) {
+        priv->pil_h = subsystem_get("adsp");   /* ← 载入 adsp.mbn，ADSP 起来 */
+```
+
+`TECHPACK=n` 时这段代码不在内核里，ADSP 永远不启动，于是真机上出现：
+
+```
+adsprpcd: apps_dev_init failed for domain 0, errno Transport endpoint is not connected  ← 死循环
+audio_hw_utils: audio_extn_utils_open_snd_mixer: retry, retry_num 18                    ← 无限重试
+/sys/class/sound/  → 只有 timer，没有 card0
+ServiceManager: Waiting for service 'media.audio_policy' …                              ← 开机永远完不成
+```
+
+`/dev/fastrpc-*` 打不开并返回 ENOTCONN，含义就是 **ADSP 远程处理器没在运行**。
+厂商的 `audio_adsp_loader.ko` 顶不上（同上，ABI 不兼容）。
+
+**修复 = 构建时不要再传 `TECHPACK=n`**（`techpack/Kbuild` 里 `TECHPACK?=y`
+本来就是默认值）。详见 `s6patch声音/README.md`。
+
+#### 1.1 设备树侧的证据（全部核对过，**无需改 DT**）
+
+`imgdata/boot.img` 的 dtb 段含 10 棵基础树，其中 `boot08` = **SDMMAGPIEP SoC**（本机）；
+`dtbo.img` 含 9 个覆盖层，其中带 `qcom,hall`（BBK 升降霍尔）与 bbk/h130 标记的
+`dtbo02/04/05/07` 是 BBK 的覆盖层。四处关键节点：
+
+```
+boot08.dts:17336   qcom,msm-adsp-loader { status="ok"; compatible="qcom,adsp-loader";
+                                          qcom,adsp-state = <0x00>; }
+boot08.dts:~4471   qcom,lpass@62400000 { compatible="qcom,pil-tz-generic";
+                                          qcom,pas-id=<0x01>;
+                                          qcom,firmware-name="adsp";      ← 载入 adsp.mbn
+                                          mbox-names="adsp-pil"; }
+boot08.dts:17226   sound { compatible = "qcom,sm6150-asoc-snd"; … }       ← 匹配内置 sm6150.c
+dtbo04.dts:4342    fragment@54 → __overlay__ { qcom,model = "sm6150-wcd9375-snd-card";
+                                               compatible = "qcom,sm6150-asoc-snd";
+                                               status = "ok"; }
+```
+
+* 内置机驱动 `techpack/audio/asoc/sm6150.c` 用
+  `snd_soc_of_parse_card_name(card, "qcom,model")` 取卡名 →
+  运行时卡名就是 **`sm6150-wcd9375-snd-card`**（ALSA 截断为 `sm6150wcd9375sn`），
+  与厂商音频 HAL 的 `get_sndcard_id()` 期望一致；
+* 打包 `boot.img` 时 **dtb 段逐字节保留原厂**
+  （`mkboot2.py` 自检含 `chk("dtb == factory")`），且不刷 `dtbo`，
+  所以设备实际使用的树一定包含上述节点；
+* `adsp-loader.c` 的判定路径：DT `qcom,adsp-state = <0>`、无 `qcom,proc-img-to-load`
+  → `goto load_adsp` → `apr_get_q6_state()` 为 `APR_SUBSYS_DOWN`
+  → **`subsystem_get("adsp")`** → 绑定 `qcom,lpass@62400000` 载入 `adsp.mbn`。
+
+#### 1.2 第二层根因：机驱动硬编码了 TFA98xx，而本机是 AW882xx
+
+把音频栈编进内核后，日志给出了更具体的报错（关键两行）：
+
+```
+<6>[ 1.462112] [Awinic][2-0034]aw882xx_dai_drv_append_suffix: dai name [aw882xx-aif-2-34]
+<3>[10.442602] sm6150-asoc-snd ...: ASoC: CODEC DAI tfa98xx-aif-2-34 not registered
+```
+
+`techpack/audio/asoc/sm6150.c` 的 `populate_snd_card_dailinks()` 里有一段**本地改动**
+（带中文注释），把两个 MI2S 后端 link 的 legacy 单 codec 字段硬编码成 TFA98xx：
+
+```c
+msm_mi2s_be_dai_links[0].codec_name     = "tfa98xx.2-0034";
+msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
+msm_mi2s_be_dai_links[1].codec_name     = "tfa98xx.2-0036";
+msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
+```
+
+本机（P20H130）的功放**不是 TFA98xx**，而是 i2c 2-0034 / 2-0036 上的
+**AWINIC AW882xx**（驱动 probe 时打印 `aw882xx 1852 detected`），
+注册的 DAI 是 `aw882xx-aif-2-34` / `aw882xx-aif-2-36`。
+
+致命机制在 `sound/soc/soc-core.c`：
+
+```c
+static int snd_soc_init_multicodec(struct snd_soc_card *card,
+				   struct snd_soc_dai_link *dai_link)
+{
+	/* Legacy codec/codec_dai link is a single entry in multicodec */
+	if (dai_link->codec_name || dai_link->codec_of_node ||
+	    dai_link->codec_dai_name) {
+		dai_link->num_codecs = 1;
+		dai_link->codecs[0].name     = dai_link->codec_name;
+		dai_link->codecs[0].dai_name = dai_link->codec_dai_name;
+	}
+```
+
+只要 legacy 字段非空，link 就被收缩成「1 个 codec」，`codecs[0]` 被整体覆盖 →
+**同一文件里本来就正确的**表被丢弃：
+
+```c
+/* sm6150.c:6900，由 CONFIG_SND_SOC_AWINIC_AW882XX 选中 */
+struct snd_soc_dai_link_component awinic_codecs[] = {
+	{ .dai_name = "aw882xx-aif-2-34", .name = "aw882xx_smartpa.2-0034" },
+	{ .dai_name = "aw882xx-aif-2-36", .name = "aw882xx_smartpa.2-0036" },
+};
+```
+
+→ `snd_soc_register_card()` 永远 `-EPROBE_DEFER` → 无 `card0` →
+音频 HAL 在 `get_sndcard_id()` 段错误 → 卡第二屏。
+
+**反证（原厂怎么做）**：从 `super_5.img` 提取的原厂机驱动 `machine_dlkm.ko`：
+
+* **没有** `dual speaker configured (34 & 36)` 这条字符串 → 那 4 行不是原厂代码；
+* 符号表里有 `aw882xx_dails`（**48 字节 = 2 × `snd_soc_dai_link_component`**）、
+  `tfa98xx_dails`、`fs16xx_codecs` → 原厂**一律用 `.codecs`/`.num_codecs` 组件表**，
+  从不走 legacy 字段。
+
+**修复**：删掉那 4 行，让 `awinic_codecs` 生效（`s6patch声音/0004`）。
 
 ### 2. 后置相机失效：原厂相机节点补丁不在源码里
 
@@ -114,16 +237,20 @@ reg[0x0703] = 0xff, ...
 
 可复现构建脚本，关键点：
 
-* `TECHPACK=n`：把 techpack 排除出内核镜像（音频兼容修复的核心）；
+* **`TECHPACK=y`（关键，不要传 `TECHPACK=n`）**：让 `techpack/audio` 编进内核，
+  从而带上 ADSP loader 与整套音频栈 —— **这就是无声问题的修复**（见第一节）；
+  脚本里还加了编后自检，确认 `adsp-loader`/`bolero`/`wcd937x`/`aw882xx`
+  等符号真的进了 `Image.gz`；
 * `LD=ld.lld`：发行版自带的 aarch64 GNU ld 2.38 会把 `.bss.rtic`
   放错位置，链接报
   `relocation truncated to fit: R_AARCH64_ADR_PREL_PG_HI21`，
   用 LLVM lld 11 链接即可（原厂用的是 binutils 2.27，行为不同）；
+* `CONFIG_MODULE_SIG_FORCE=n`：厂商模块用原厂密钥签名，本内核验签必然失败；
 * clang 11（`/usr/bin/clang-11`，即 Ubuntu clang 11.1.0）+ GNU binutils 汇编器。
 
 ---
 
-### 3. `arch/arm64/kernel/vmlinux.lds.S`（链接布局修复，必须）
+### 4. `arch/arm64/kernel/vmlinux.lds.S`（链接布局修复，必须）
 
 厂商脚本里 `.bss.rtic`（`__rticdata`，含 `selinux_state`）被放在
 `STABS_DEBUG`（`.stab 0 : {...}` 显式地址 0 的调试段）之后：
@@ -155,7 +282,7 @@ _end             = ffffff800a1f2000
 
 刷入后设备正常开机（`Linux version 4.14.190-perf+ ... clang version 11.1.0-6, LLD 11.1.0`）。
 
-### 4. `.scmversion`（vermagic 修复，必须）
+### 5. `.scmversion`（vermagic 修复，必须）
 
 源码树里存在 `.git` 时，`scripts/setlocalversion` 会给出 `4.14.190-perf+`，
 而厂商 DLKM 模块记录的是 `4.14.190-perf`，**vermagic 不匹配会导致全部厂商模块
@@ -165,48 +292,77 @@ _end             = ffffff800a1f2000
 `make kernelrelease` 即回到 `4.14.190-perf`，与厂商模块一致。
 （用本仓库 `.github/workflows/build.yml` 的 CI 方式构建时没有 `.git`，不受影响。）
 
+### 6. `kernel/module.c`（放行厂商 DLKM 的符号 CRC，必须）
+
+厂商模块带 `CONFIG_MODVERSIONS` 的符号 CRC，且是在完整厂商树里算出来的
+（实测 `module_layout` 期望 `0xcc8cac52`，本内核算出 `0x021f9ae4`）。
+`CONFIG_MODVERSIONS` 不能关——`modversions` 是 vermagic 字符串的一部分，
+关掉会变成 `… mod_unload aarch64`，与厂商模块
+`… mod_unload modversions aarch64` 不匹配，反而更糟。
+
+修法：把 `check_version()` 的 `bad_version` 分支改为「只警告、返回 1（接受）」，
+等价 `modprobe --force`。实测 `lsmod` 从 1 → 35，
+厂商音频 HAL 也不再在 `get_sndcard_id()` 段错误。
+
+> 注意：这一步**只解决「模块装不上」，不解决「没声音」**。
+> 真正让声音回来的还是第 3 条的 `TECHPACK=y`。
+
 ---
 
 ## 三、真机验证结果（adb / fastboot）
 
 设备：EEBBK S6（`ro.boot.serialno=2fa7c794`，Android 11，非 A/B，boot 分区 64MB）
 
-| 检查项 | 原厂内核 | 本仓库修复后（实测） |
-|---|---|---|
-| 内核启动 | ✓ | ✓（clang 11 + lld，`4.14.190-perf`） |
-| `/proc/driver/BackCamera_info` | 存在 | **存在** ✓ |
-| `/proc/driver/FrontCamera_info` | 存在 | **存在** ✓ |
-| 节点内容 | `Module Vendor: Q Tech (2742EJ36Q0F002DT),…` | 同格式（见第二节还原依据） |
-| `dumpsys media.camera` 相机数 | 2 | **1（仅后摄）** ⚠ 前摄需要原厂私有 sensor 代码 |
-| 厂商音频 DLKM | 33 个已加载，`aw882xx_dlkm` 工作中 | **未加载**（`lsmod` 仅 1 行）⚠ |
-| `sys.boot_completed` | 1 | 空（卡开机动画）⚠ |
-| 升降/霍尔等 BBK 节点 | 有驱动 | 只有 DT 里的 platform device，无驱动 ⚠ |
+| 检查项 | 原厂内核 | 旧构建 `TECHPACK=n` | `TECHPACK=y`（未修 codec 名） | **最终 `boot_audio2.img`（实测）** |
+|---|---|---|---|---|
+| 内核启动 | ✓ | ✓ | ✓ | ✓ `clang 11.1.0 / LLD` `#2` |
+| `/proc/driver/BackCamera_info` | 存在 | ✓ | ✓ | **✓** |
+| `/proc/driver/FrontCamera_info` | 存在 | ✓ | ✓ | **✓** |
+| `dumpsys media.camera` | 2 | 1（仅后摄） | 1 | **1（仅后摄，前摄需原厂私有 sensor 代码）** |
+| `/sys/class/sound/card0` | 有 | **无（只有 `timer`）** | **无（只有 `timer`）** | **有 ✅ 23 个 `pcmC0D*p` 播放设备 + 12 个 `comprC0D*`** |
+| 声卡名 | `sm6150-wcd9375-snd-card` | — | — | **HAL 打印 `snd_card_name: sm6150-wcd9375-snd-card`，`Opened sound card:0` ✅** |
+| 音频 HAL 崩溃 | 无 | `get_sndcard_id+572` SIGSEGV 反复 | 同左 | **无 ✅** |
+| `adsprpcd` | 正常 | `Transport endpoint is not connected` 死循环 | 不再报错 | **不再报错，3 进程稳定 ✅** |
+| `sys.boot_completed` | 1 | **空（卡开机动画）** | **空（卡开机动画）** | **`1` ✅** |
+| `init.svc.bootanim` | stopped | running | running | **stopped ✅** |
+| 框架路由到扬声器 | ✓ | ✗ | ✗ | **`AudioFlinger: Output thread AudioOut_D → Output devices: 0x2 (AUDIO_DEVICE_OUT_SPEAKER)`，`CFG_EVENT_CREATE_AUDIO_PATCH: new device 0x2` ✅** |
+| 升降/霍尔等 BBK 节点 | 有驱动 | 无驱动 | 无驱动 | 无驱动（源码缺 BBK 私有驱动） |
 
-### 当前阻塞点：厂商 DLKM 仍不加载
+### 关键差异：内核里有没有 ADSP loader
 
-vermagic 修正后（`4.14.190-perf`，与原厂一致）模块仍未加载，表现为
-`lsmod` 只有 1 行、`sys.boot_completed` 为空、停在开机动画（“第二屏”）。
-可能原因与下一步：
+```
+旧构建（TECHPACK=n）Image.gz 里的音频符号：
+  aw882xx 0    wcd937x 0    bolero 0    adsp-loader 0    q6afe 0     ← 全部为 0
 
-1. `CONFIG_MODVERSIONS=y`（本内核与原厂一致）会对模块做符号 CRC 校验；
-   我们的源码缺 BBK 私有驱动、编译链也不同，CRC 可能不一致
-   → 试 `CONFIG_MODVERSIONS=n` 重新构建（内核侧关闭 CRC 校验，模块侧 vermagic 仍匹配）；
-2. 需要 `dmesg`（当前无 root，Magisk 因多次失败启动进入保护状态）确认
-   具体报错是 `disagrees about version of symbol` 还是 `Unknown symbol`；
-3. 若为 `Unknown symbol`，说明模块依赖原厂私有驱动导出的符号，
-   那就必须补齐 BBK 源码才能继续。
+新构建（TECHPACK=y）Image.gz 里的音频符号：
+  adsp-loader 2    q6afe 8    bolero 19    wcd937x 30    aw882xx 27
+```
+
+旧构建「卡开机动画」的完整因果链：
+
+```
+TECHPACK=n → 内核无 adsp-loader.c → qcom,adsp-loader 节点无人绑定
+          → subsystem_get("adsp") 从不调用 → ADSP 不启动
+          → /dev/fastrpc-* 返回 ENOTCONN → adsprpcd 死循环
+          → 音频 HAL 的 open_snd_mixer 无限重试（retry_num 18…）
+          → audioserver 无法发布 media.audio_policy
+          → SystemServer 一直等 → 开机永远完不成
+```
+
+这也解释了为什么「CRC 放行让厂商模块装上（`lsmod` 1 → 35）」之后仍然无声：
+模块装得上，但 **ADSP 依然没人去拉起**。
 
 刷机要点（实测）：
 
 * 本机 **只有在 fastbootd 模式下** `fastboot flash boot` 才被接受
-  （bootloader 模式返回 `unknown command` / `Unrecognized command download`）；
-* fastbootd 下设备序列号为 `2fa7c794`；recovery/fastbootd 等模式下 adb 序列号
-  可能显示为 `0123456789ABCDEF`（**据此判断当前模式，也避免刷错设备**）；
-* 原厂 `imgdata/boot.img` 可直接刷回恢复。
+  （bootloader 模式返回 `unknown command`）；
+* fastbootd 下 `fastboot getvar is-userspace` 返回 `yes`、
+  `getvar product` 返回 `sm6150`（**据此判断当前模式**）；
+* 原厂 `imgdata/boot.img` 可直接刷回恢复，功能正常。
 
 > 提醒：本仓库源码缺少 BBK 私有驱动，因此自编译内核在真机上会
-> 丢失升降前摄/霍尔/传感器/ramext 等功能，且可能无法让原厂 userspace 完整启动。
-> 若目标只是“可用的自定义内核”，建议先拿到完整原厂源码树再动内核。
+> 丢失升降前摄/霍尔/传感器/ramext 等功能。但**声音与相机这两项不依赖它们**，
+> 由本仓库自带的音频栈 + 相机 proc 补丁实现。
 
 
 ## 四、已知未覆盖项（源码本身缺失，非本次改动引入）
@@ -282,7 +438,7 @@ bbk_hall_vendor
 
 ---
 
-## 六、真机刷机排查全过程（最终结论：缺 BBK 私有驱动）
+## 六、真机刷机排查全过程（最终结论：`TECHPACK=n` 把 ADSP loader 挡在内核之外）
 
 按顺序踩到并解决/定位的问题，全部有真机证据：
 
@@ -292,28 +448,48 @@ bbk_hall_vendor
 | 2 | 卡**第二屏**、`lsmod` 只有 1 行 | 源码树带 `.git` → vermagic 变 `4.14.190-perf+`，厂商模块拒装 | 已修（空 `.scmversion`） |
 | 3 | 仍 `lsmod`=1 | `CONFIG_MODULE_SIG_FORCE=y` 只认本内核密钥签名的模块 | 已修（`SIG_FORCE=n`，vermagic 不变） |
 | 4 | 仍 `lsmod`=1 | `CONFIG_MODVERSIONS` 符号 CRC 不匹配（源码缺 BBK 补丁） | 已修（`kernel/module.c` 的 `bad_version` 改为接受，等价 `modprobe --force`；保留 `MODVERSIONS=y` 维持 vermagic） |
-| 5 | 模块终于装上（35 个）、音频 HAL 不再崩，但**声卡仍建不出来** → 卡第二屏 | `/sys/class/sound/` 只有 `timer`；`audio_extn_utils_open_snd_mixer` 无限重试；`adsprpcd` ADSP 起不来；i2c `2-0034` 无驱动绑定 | **缺 BBK 私有驱动，本仓库无解** |
+| 5 | 模块终于装上（35 个）、音频 HAL 不再崩，但**声卡仍建不出来** → 卡第二屏 | `/sys/class/sound/` 只有 `timer`；`audio_extn_utils_open_snd_mixer` 无限重试；`adsprpcd` 报 `Transport endpoint is not connected` → **ADSP 没起来**；i2c `2-0034` 无驱动绑定 | 已定位：内核里没有 ADSP loader |
+| 6 | 上述根因 | 构建脚本传了 `TECHPACK=n` → `techpack/Kbuild` 只编 `stub/` → 内核里没有 `adsp-loader.c`，`subsystem_get("adsp")` 从不调用；厂商 `audio_adsp_loader.ko` 又因 ABI 不兼容顶不上 | **已修**：改为 `TECHPACK=y`（即不传 `TECHPACK=n`），音频栈 + ADSP loader 全部内置 |
 
 对照原厂内核（同机实测）：`sys.boot_completed=1`、**36 个模块全部加载**、
-`/proc/asound/cards` 有 `sm6150-wcd9375-snd-card`、`aw882xx_dlkm` 工作中
-—— 差的正是源码树里没有的那批 BBK 驱动。
+`/proc/asound/cards` 有 `sm6150-wcd9375-snd-card`、`aw882xx_dlkm` 工作中。
+本修复不依赖那批厂商模块，而是让内核自带一份 ABI 自洽的音频栈。
 
 ### 交付与交接建议
 
-* 相机 proc 补丁 + 链接布局修复：`dist/eebbk_s6_camera_proc.patch`
-* 构建要点：clang-11 + `ld.lld`、`TECHPACK=n`、空 `.scmversion`；
-  单独编译时还需 `CONFIG_MODULE_SIG_FORCE=n` + `module.c` CRC 放行
-* **最优路径**：向提供原厂包/原厂内核的人索取**完整源码树**（含 BBK 驱动），
-  套上本补丁即可得到完全可用的自编译内核
-* 设备已刷回原厂 `imgdata/boot.img`，功能正常
+* 相机 proc 补丁 + 链接布局修复：`s6patch相机/`、`dist/eebbk_s6_camera_proc.patch`
+* 声音修复：`s6patch声音/`
+* 构建要点：clang-11 + `ld.lld`、**`TECHPACK=y`（不要传 `n`）**、空 `.scmversion`；
+  还需 `CONFIG_MODULE_SIG_FORCE=n` + `module.c` CRC 放行（供非音频的厂商模块加载）
+* 可刷镜像：`dist/boot_native.img`（`TECHPACK=y`，音频栈已内置并自检通过）
+* 设备恢复：`fastboot flash boot imgdata/boot.img`
 
 ### 刷机备忘（本机特有）
 
-* 只有 **fastbootd**（`fastboot devices` 显示 `2fa7c794`）能刷 `boot`；
-  bootloader 模式与序列号 `0123456789ABCDEF` 的那种模式都会返回
-  `unknown command` / `Unrecognized command download`
+* 只有 **fastbootd**（`fastboot getvar is-userspace` = `yes` 且接受 `flash`）能刷 `boot`；
+  实测三种模式的差别：
+  | 进入方式 | `fastboot devices` 序列号 | `flash boot` 结果 |
+  |---|---|---|
+  | **手动进入 fastbootd** | `2fa7c794` | ✅ 成功 |
+  | `adb reboot fastboot` | `0123456789ABCDEF` | ✗ `Unrecognized command download` |
+  | 上一步后再 `fastboot reboot bootloader` | `2fa7c794` | ✗ `unknown command`（这是 ABL） |
 * 刷自定义 boot 会覆盖 Magisk 的 ramdisk（root 消失）
 * 原厂 `imgdata/boot.img`（64 MB，与分区等大）随时可刷回
+
+### 关于 QMMI（高通的工厂测试 App，与本次内核改动无关）
+
+用本内核时曾出现「开机后进入 QMMI 测试界面」的现象，实测**不是内核造成的**：
+
+* 原厂内核下 QMMI 进程**同样**会在开机时被拉起
+  （`ActivityManager: Start proc ... for broadcast {com.qualcomm.qti.qmmi/com.qualcomm.qti.qmmi.framework.QmmiReceiver}`）；
+* 差别只在于是否抢占前台：原厂内核下前台是 `com.bbk.studyos.launcher`，那次是本内核下
+  `QmmiReceiver.startMainActivity` 被调用、QMMI 的 `MainActivity` 成了前台。
+* QMMI 监听 `android.intent.action.BOOT_COMPLETED` 与 `android_secret_code`（`7664` = QMMI），
+  属于 ROM/工厂测试状态，不是启动模式；`fastboot flash boot imgdata/boot.img` 并正常重启后已回到桌面。
+
+排查中同时确认：QMMI 的 APK（`/system_ext/app/Qmmi/Qmmi.apk`）是**加密封装**
+（`unzip` 报 "End-of-central-directory signature not found"），
+与之前 `BBKCamera.apk` 的 BPK 情况一致，无法直接静态分析。
 
 ---
 
