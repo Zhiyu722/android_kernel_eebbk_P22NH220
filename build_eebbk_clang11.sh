@@ -47,6 +47,17 @@ mkdir -p "$OUT"
 cp "arch/arm64/configs/$KCONFIG" "$OUT/.config"
 make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" olddefconfig
 
+# The vendor DLKM modules in /vendor/lib/modules were signed with the vendor
+# module key and carry CRCs computed in the complete vendor tree.  A kernel
+# built here cannot match either, so relax just those two checks - the
+# vermagic string itself stays identical (that one must match!):
+#   * CONFIG_MODULE_SIG_FORCE=n   (keep CONFIG_MODULE_SIG / MODVERSIONS =y)
+#   * kernel/module.c check_version() accepts CRC mismatches (see bad_version)
+echo "== relax module signature force =="
+sed -i 's/^CONFIG_MODULE_SIG_FORCE=y/# CONFIG_MODULE_SIG_FORCE is not set/' "$OUT/.config"
+make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" olddefconfig
+grep -E '^CONFIG_MODVERSIONS|^# CONFIG_MODULE_SIG_FORCE' "$OUT/.config"
+
 echo "== build Image.gz =="
 make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" DTC=dtc Image.gz
 

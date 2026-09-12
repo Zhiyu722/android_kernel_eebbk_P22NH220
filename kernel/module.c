@@ -1322,9 +1322,23 @@ static int check_version(const struct load_info *info,
 	return 1;
 
 bad_version:
-	pr_warn("%s: disagrees about version of symbol %s\n",
+	/*
+	 * EEBBK S6 (P20H130): the vendor DLKM modules in /vendor/lib/modules
+	 * are built from the complete vendor source tree, together with the
+	 * kernel that ships with the device.  A kernel built from this
+	 * (incomplete) source tree computes different symbol CRCs, so every
+	 * vendor module used to be rejected here - which removed the sound
+	 * card, made the vendor audio HAL crash and left the device stuck on
+	 * the boot animation.
+	 *
+	 * CONFIG_MODVERSIONS cannot simply be turned off because "modversions"
+	 * is part of the vermagic string the vendor modules carry.  Accept the
+	 * mismatch instead (same effect as "modprobe --force") and keep the
+	 * warning so the mismatch stays visible.
+	 */
+	pr_warn("%s: disagrees about version of symbol %s (accepted for vendor modules)\n",
 	       info->name, symname);
-	return 0;
+	return 1;
 }
 
 static inline int check_modstruct_version(const struct load_info *info,

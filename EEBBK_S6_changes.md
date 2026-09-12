@@ -278,3 +278,64 @@ bbk_hall_vendor
 （后摄 id=0、前摄 id=1），若 App/HAL 是先读 `FrontCamera_info` 再触发升降机构，
 则本次修复对前摄也有帮助。
 
+
+
+---
+
+## 六、真机刷机排查全过程（最终结论：缺 BBK 私有驱动）
+
+按顺序踩到并解决/定位的问题，全部有真机证据：
+
+| # | 现象 | 根因 | 状态 |
+|---|---|---|---|
+| 1 | 刷入后卡**第一屏** | `.bss.rtic`（含 `selinux_state`）被链接到 `_end` 之外，运行时被页分配器覆盖 | 已修（`vmlinux.lds.S`） |
+| 2 | 卡**第二屏**、`lsmod` 只有 1 行 | 源码树带 `.git` → vermagic 变 `4.14.190-perf+`，厂商模块拒装 | 已修（空 `.scmversion`） |
+| 3 | 仍 `lsmod`=1 | `CONFIG_MODULE_SIG_FORCE=y` 只认本内核密钥签名的模块 | 已修（`SIG_FORCE=n`，vermagic 不变） |
+| 4 | 仍 `lsmod`=1 | `CONFIG_MODVERSIONS` 符号 CRC 不匹配（源码缺 BBK 补丁） | 已修（`kernel/module.c` 的 `bad_version` 改为接受，等价 `modprobe --force`；保留 `MODVERSIONS=y` 维持 vermagic） |
+| 5 | 模块终于装上（35 个）、音频 HAL 不再崩，但**声卡仍建不出来** → 卡第二屏 | `/sys/class/sound/` 只有 `timer`；`audio_extn_utils_open_snd_mixer` 无限重试；`adsprpcd` ADSP 起不来；i2c `2-0034` 无驱动绑定 | **缺 BBK 私有驱动，本仓库无解** |
+
+对照原厂内核（同机实测）：`sys.boot_completed=1`、**36 个模块全部加载**、
+`/proc/asound/cards` 有 `sm6150-wcd9375-snd-card`、`aw882xx_dlkm` 工作中
+—— 差的正是源码树里没有的那批 BBK 驱动。
+
+### 交付与交接建议
+
+* 相机 proc 补丁 + 链接布局修复：`dist/eebbk_s6_camera_proc.patch`
+* 构建要点：clang-11 + `ld.lld`、`TECHPACK=n`、空 `.scmversion`；
+  单独编译时还需 `CONFIG_MODULE_SIG_FORCE=n` + `module.c` CRC 放行
+* **最优路径**：向提供原厂包/原厂内核的人索取**完整源码树**（含 BBK 驱动），
+  套上本补丁即可得到完全可用的自编译内核
+* 设备已刷回原厂 `imgdata/boot.img`，功能正常
+
+### 刷机备忘（本机特有）
+
+* 只有 **fastbootd**（`fastboot devices` 显示 `2fa7c794`）能刷 `boot`；
+  bootloader 模式与序列号 `0123456789ABCDEF` 的那种模式都会返回
+  `unknown command` / `Unrecognized command download`
+* 刷自定义 boot 会覆盖 Magisk 的 ramdisk（root 消失）
+* 原厂 `imgdata/boot.img`（64 MB，与分区等大）随时可刷回
+
+---
+
+## 七、升降前摄接口（供后续逆向重写驱动）
+
+真机原厂内核下抓到的完整接口：
+
+```
+/sys/devices/platform/soc/soc:bbk_vib_pwm/   driver=bbk_vib_pwm, 带 of_node + input/
+  vib_pwm_camera_state      <-- 0=收回 1=升起 2=升起并偏转（用户确认的原厂逻辑）
+  vib_pwm_elevator_mode / vib_pwm_elevator_row_shift / vib_pwm_holder_mode
+  vib_pwm_cali / vib_pwm_clear_cali_data / vib_pwm_up_down_count / vib_pwm_count
+  vib_pwm_dir / vib_pwm_freq / vib_pwm_time / vib_pwm_enable / vib_pwm_id
+  vib_pwm_state_init / vib_pwm_abort_notify
+```
+
+状态机线索（原厂内核字符串）：`[LYQ-damon-vib] Start change camera_state from [%d] to [%d]`、
+`damon enter vib_pwm_set_camera`、`RESTART_CAMERA_ELEVATOR to elevator_mode %d`、
+`damon enter handle input KEY_CAMERA_PRESS_MOVE & because: hall_up - hall_down < (cali_data.position1.hall_up_down_diff ...)`、
+`[LYQ-damon-hall] detect press`、`damon hall sensor is not cali`；
+校准数据在 `/mnt/vendor/persist/sensors/`（`cali_hall`、`up_down_count`）。
+
+设备树：`hall` 节点（`compatible="qcom,hall"`、GPIO93 中断）在 dtbo 覆盖层；
+`bbk_vib_pwm` 节点不在 `imgdata` 的 dtbo/boot DTB 里，说明设备上是原厂那份 dtbo
+—— **不要刷用本仓库编译的 dtbo，否则 hall/vib 节点会丢**。
