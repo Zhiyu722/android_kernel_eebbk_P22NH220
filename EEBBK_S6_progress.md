@@ -406,3 +406,88 @@ adb shell dmesg | grep -i 'vib\|m1120\|bbk_hall'
    上游 4.14.y verifier 补丁已备好（`/root/bpfpatch/bpf_4.14y.patch`，670 行，可干净应用）。
 6. **QMMI**：ROM 的工厂测试 App（`BOOT_COMPLETED` 接收器，暗码 7664），
    与内核改动无关，原厂内核同样自启。
+
+---
+
+## 十一、升降前摄打通（本轮，已真机验证）
+
+### 根因：GP 时钟表缺少低频挡位
+
+本机时钟控制器是 `compatible = "qcom,gcc-sdmmagpie"`（设备树 `qcom,gcc@100000`），
+而本仓库同时编入了三个 GCC 驱动（`SM6150`/`SDMMAGPIE`/`SM8150`，与原厂二进制里
+三份同名 `gcc_gp2_clk_src` 一一对应）。**真正生效的是 sdmmagpie 那份**。
+
+升降电机的斩波时钟是 `<&gcc GCC_GP2_CLK>` = `gcc_gp2_clk`（分支时钟），其父为
+`gcc_gp2_clk_src`（mnd RCG）。厂商驱动与本项目复刻都调用
+`clk_set_rate(branch, 32000)`，但**分频器在父 RCG 上**，而 `gcc-sdmmagpie.c` 里的
+`ftbl_gcc_gp1_clk_src` 只有 `19.2M / 25M / 50M / 100M / 200M` —— 32 kHz 无处落地。
+
+实测证据（`/proc/eebbk_pins` + `vib_pwm_debug`）：
+
+```
+gp2_clk rate=19200000  round(32000)=19200000  parent=gcc_gp2_clk_src parent_rate=19200000
+```
+
+即引脚始终输出 **19.2 MHz**，电机驱动芯片无法在此频率下开关 → 只有轻微声音、没有扭矩，
+机构不动。**原厂固件的这套升降逻辑同样是不工作的**（它请求的就是这些低频值）。
+
+### 修复：按原厂二进制还原频率表
+
+用脚本扫描原厂 `vmlinux`（`work/tools/gp_clk_table.py`、`gp_clk_who.py`、
+`gp_clk_full.py`）：以 `cmd_rcgr = 0x65004` 定位 RCG 结构，读 +16 处的 `freq_tbl` 指针，
+再经 `clkr.hw.init -> clk_init_data.name` 确认身份，得到 sdmmagpie 那份表：
+
+| 频率 | src | pre_div | m | n |
+|---|---|---|---|---|
+| 19200 | 0 (bi_tcxo) | 31 | 4 | 250 |
+| 32000 | 0 | 31 | 2 | 75 |
+| 41600 | 0 | 29 | 8 | 246 |
+| … | 0 | … | … | … |
+
+`F(f,s,h,m,n)` 写入结构体时 `pre_div = 2h-1`，而
+`clk_rcg2_calc_rate() = (父频/h) * m / n`：
+
+```
+19200000 / 16 * 2 / 75  = 32000    普通移动
+19200000 / 16 * 4 / 250 = 19200    远距离移动第一段
+19200000 / 15 * 8 / 246 = 41626    第二段
+```
+
+正是 `gpio_pwm.c` 请求的三个频率。补丁 0033 把整张表（4800…64000 + 原有高频项）
+逐条写回 `gcc-sdmmagpie.c`；补丁 0034 另外把频率设到父 RCG 上并修掉
+`clk_core_disable` 的引用计数 WARNING。
+
+### 验证结果
+
+```
+vib_pwm_set_clock: freq 32000, gcc_gp2_clk_src -> 32000 Hz, branch 32000 Hz
+up 0: ... gp2_clk rate=32000 ... enabled=1 parent_rate=32000 boost=1 en=0 sleep=1 dir=0
+```
+
+- 引脚电平序列（boost=1 / enable=0 / sleep=1 / dir=0 上升、dir=1 下降）与工厂逐指令一致
+- `pinctrl active/suspend` 选择成功，移动时长按 6/10 脉冲数换算
+- **用户实测：前摄能正常升起，无异响、无卡住** ✅
+
+### 附带修正
+
+- **霍尔解码（0035）**：芯片 ID 在寄存器 `0x09`（值 `0x9c`）；测量值高位取自 `0x10` 块
+  第三字节并做 10 位补码符号扩展，无 DRDY 时返回 `-1`（`data` 显示 `-2000`）。
+  此前误从 `0x00` 读高位，导致读数恒为 256。
+- **调试能力（0036）**：`/proc/eebbk_kmsg` 支持写关键字过滤与 `clear`；
+  `/proc/eebbk_pins` 输出 21/23/24/25/26/29 号引脚电平方向与 `gcc_gp2_clk` 频率。
+  这两个节点是定位本轮问题的主要手段，仅存在于 bring-up 构建。
+
+### 仍未解决
+
+1. **霍尔不产生测量值**：`0x10` 数据块恒为 0（芯片能应答 ID，但未进入转换），
+   `bbk_hall_data` 上报 `up:-2000 down:-2000`。升降的移动是开环定时，不依赖霍尔。
+2. **触摸 DRM 通知修复**未真机实测。
+3. **WiFi 打不开**（`Failed to load WiFi driver` / `Wifi HAL start failed`），按用户要求暂缓。
+
+### 交付
+
+| 文件 | 说明 | md5 |
+|---|---|---|
+| `dist/boot_release.img` | 正式版：全部修复，关闭 bring-up 调试 | `df22126716c7b7831fb91f41fa330a53` |
+| `dist/boot_cam11.img` | 调试版（#30），升降即在此版验证 | `92bf1cf3c19978ebd36dad06c5792d17` |
+| `patch+++/` | 全部补丁合并整理（含 README 索引） | — |
