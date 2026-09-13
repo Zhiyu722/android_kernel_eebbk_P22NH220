@@ -50,6 +50,14 @@ static ssize_t bbk_kmsg_read(struct file *file, char __user *ubuf,
 	if (!count)
 		return 0;
 
+	/*
+	 * READ_ALL always hands back the whole ring buffer, so without this a
+	 * reader like cat would loop for ever.  One snapshot per open is what a
+	 * bring-up node needs.
+	 */
+	if (*ppos)
+		return 0;
+
 	ret = do_syslog(SYSLOG_ACTION_READ_ALL, ubuf, count, SYSLOG_FROM_PROC);
 	if (ret > 0)
 		*ppos += ret;
