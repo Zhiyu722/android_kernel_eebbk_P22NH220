@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 21:50:04 +0800
+Subject: [PATCH] docs: Add the hall sensor reverse-engineering notes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+s6patch霍尔/README.md records why the BBK hall/elevator drivers are absent from
+this tree, the recovery method (vmlinux-to-elf on the factory Image plus
+per-function disassembly and mechanical extraction of every i2c access), the
+recovered IST8801 register map and data path, the MXM1120 / bbk_hall_core /
+vib_pwm symbol inventory, the userspace interface that has to be matched, and
+the step-by-step plan.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ s6patch霍尔/README.md | 164 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 164 insertions(+)
+ create mode 100755 s6patch霍尔/README.md
+
+diff --git a/s6patch霍尔/README.md b/s6patch霍尔/README.md
+new file mode 100755
+index 000000000..20b663eb0
+--- /dev/null
++++ b/s6patch霍尔/README.md
+@@ -0,0 +1,164 @@
++# s6patch霍尔 — EEBBK S6 (P20H130) 霍尔传感器 / 升降摄像头子系统
++
++状态：**逆向与重写进行中**（第一步 IST8801 驱动已落地并编译通过）
++
++## 一、问题：四个私有驱动在源码里完全不存在
++
++原厂内核里有一套完整的 BBK 霍尔/升降子系统，但**本仓库源码树一个字的实现都没有**：
++
++```
++grep -rl 'mxm1120|ist8801|magnachip|isentek|bbk_hall|hall_queue' <源码树>  →  0 命中
++find -iname '*mxm1120*' -o -iname '*ist8801*'                          →  无驱动文件
++```
++
++而原厂内核里它们是**编进内核的**（不是模块），所以 `/vendor/lib/modules` 里也拿不到：
++
++```
++原厂 config:
++  CONFIG_INPUT_HALL=y                  ← BBK 霍尔框架 bbk_hall_core
++  CONFIG_INPUT_MXM1120_UP=y            ← Magnachip MXM1120（升）
++  # CONFIG_INPUT_MXM1120_MIDDLE is not set
++  CONFIG_INPUT_MXM1120_DOWN=y          ← Magnachip MXM1120（降）
++  CONFIG_INPUT_IST8801=y               ← iSentek IST8801（3D 霍尔开关）
++  CONFIG_VIB_PWM=y                     ← 升降电机 PWM（bbk_vib_pwm）
++```
++
++原厂设备上可见的痕迹：input 设备 `m1120_up` / `m1120_down` / `h110-vib-input`、
++`/sys/module/bbk_hall_queue`、`/sys/devices/platform/soc/soc:bbk_vib_pwm/*`。
++
++DT 侧节点（在 BBK 的 dtbo 覆盖层里，已随原厂 dtbo 保留）：
++
++```dts
++magnachip@0c { compatible = "magnachip,mxm1120,down"; reg = <0x0c>; magnachip,init-interval = <0x01>; };
++magnachip@0f { compatible = "magnachip,mxm1120,up";   reg = <0x0f>; magnachip,init-interval = <0x01>; };
++dhall@18 { status = "okay"; compatible = "isentek,ist8801-0"; reg = <0x18>; data-range = <0x00>;
++           hall,bias_support = <0x00>; hall,bias-ratio = <0x5a>; };
++dhall@1b { status = "okay"; compatible = "isentek,ist8801-2"; reg = <0x1b>; data-range = <0x00>;
++           hall,bias_support = <0x00>; hall,bias-ratio = <0x5a>; };
++ti65132s@3e { compatible = "ti,ti65132"; reg = <0x3e>; }   /* LCD 电源 IC，与本子系统无关 */
++```
++
++## 二、逆向方法（可复现）
++
++1. **把原厂 Image 还原成带符号的 ELF**（原厂内核的 kallsyms 完整保留）：
++
++   ```bash
++   pip3 install peewee                       # vmlinux-to-elf 的依赖
++   cd vmlinux-to-elf && PYTHONPATH=. python3 -m vmlinux_to_elf.scripts.vmlinux_to_elf \
++        imgdata/boot_unpacked/Image /root/factory_vmlinux.elf
++   # -> 37 MB ELF，115367 个符号
++   ```
++
++2. **按函数名反汇编**（符号表里函数名齐全，直接定位）：
++
++   ```bash
++   aarch64-linux-gnu-objdump -d --no-show-raw-insn \
++       --start-address=0x... --stop-address=0x... /root/factory_vmlinux.elf
++   ```
++
++3. **机械抽取接口**：遍历每个 `i2c_master_send` / `i2c_transfer` 调用点，
++   打印其前 16 条指令 → 得到「寄存器 + 值」；遍历 `bl` → 得到调用序列。
++   工具在 `work/tools/`：`hall_disasm.py`、`hall_i2cmap.py`、`hall_readsites.py`、
++   `hall_trace.py`、`hall_show.py`。
++
++## 三、已还原：IST8801（iSentek 3D 霍尔开关）
++
++原厂符号（19 个）：`ist8801_i2c_probe`、`ist8801_i2c_read_block`、
++`ist8801_set_operation_mode`、`ist8801_set_detection_mode`、`ist8801_hall_enable`、
++`ist8801_hall_getdata`、`ist8801_get_data`、`ist8801_get_id`、`ist8801_reset_device`、
++`ist8801_dump_reg`、`ist8801_i2c_suspend/resume`、`ist8801_ranges_1/_2` 等。
++
++### I2C 协议
++
++```
++写： buf[0]=reg, buf[1]=value ; i2c_master_send(client, buf, 2)
++     由全局 ist8801_i2c_mutex 串行化
++读： ist8801_i2c_read_block(data, reg, buf, len)   /* len <= 0x11，超出返回 -EINVAL */
++     msg[0] = {client->addr, flags=0,          len=1,   buf=&reg}
++     msg[1] = {client->addr, flags=I2C_M_RD,   len=len, buf=buf}
++     i2c_transfer(adapter, msgs, 2)
++```
++
++（`ist8801_i2c_read_block` 已逐条指令核对：栈上 `msgs` 布局、`I2C_M_RD=1`、
++`client->addr` 取自 `client+2`、`adapter` 取自 `client+24`。）
++
++### 寄存器映射（从写点/读点逐条抽出）
++
++| 寄存器 | 写入值 | 读 | 推断含义 |
++|---|---|---|---|
++| `0x01` | `0x00` / `0x01` | — | 控制：复位 / 检测使能 |
++| `0x07` | `0x01` | — | 控制 |
++| `0x08` | `0x00` / `0x40` / `0x80` | — | **工作模式**：掉电 / 测量模式 / 触发一次测量 |
++| `0x09` | — | 1B | **device id**（复位后 `msleep(20)` 再读，读两次） |
++| `0x10` | — | **5B** | 数据块（`ist8801: data [%02X x5]`，首字节 ST1） |
++| `0x20` | `0x00` / `0x02` | — | 控制 |
++| `0x40` | — | 1B | 状态/模式（测量前后各读一次） |
++| `0x54` | — | 1B | 状态 |
++| `0x00..0x13` | — | 1B×20 | `ist8801_dump_reg` 的调试导出 |
++
++### 数据通路
++
++```
++ist8801_hall_enable  →  set_detection_mode + set_operation_mode
++ist8801_hall_getdata →  读 0x40 → 写 {0x08,0x80} 触发测量
++                        → usleep_range(2000, 2500)
++                        → 读 0x10 起 5 字节 → 读 0x40 → dump 0x00..0x13 → 读 0x54
++                        → 组包成文本："ist8801 [%x], z=%6d, zc=%6d, t=%6d, t25=%6d."
++                          （框架侧按文本行消费，另有 ist8801_get_zdata_compensation /
++                            ist8801_get_t25 做 Z 轴温度补偿）
++```
++
++> 说明：`zc`/`t25` 的补偿公式在二进制里被内联展开，第一版驱动先按
++> `z`（16bit LE，取自 0x10 块）与 `t` 原样上报，补偿待后续按
++> `ist8801_get_zdata_compensation` / `ist8801_get_t25` 的反汇编补齐。
++
++## 四、已探明：MXM1120（Magnachip）与 BBK 框架
++
++原厂符号：`m1120_i2c_drv_probe`(up/down 两份)、`m1120_i2c_set_reg(_up)`、
++`m1120_measure(_up)`、`m1120_irq_handler`、`m1120_misc_dev_ioctl`、
++`m1120_attribute_group`、`m1120_input_dev_init` 等共 18 个；
++
++```
++ioctl: M1120_IOCTL_{GET,SET}_REG / _ENABLE / _DELAY / _INTERRUPT /
++       GET_CALIBRATED_DATA / SET_CALIBRATION
++日志:  [M1120-DBG] reg.map.intsrs = 0x%02X / threshold : (0x%02X%02X, 0x%02X%02X)
++       [M1120-INFO] operation mode was chnaged to OPERATION_MODE_{MEASUREMENT,
++                    POWERDOWN,FUSEROMACCESS}
++       "wait 5ms after vdd power up"  /  "sw-reset was failed"
++input: up-mxm1120 / down-mxm1120
++```
++
++BBK 框架 `bbk_hall_core`（28 个函数）：`bbk_hall_core_regsiter_device`、
++`bbk_hall_core_read_data`、`bbk_hall_core_init_queue` / `init_move_queue`、
++`bbk_hall_core_misc_dev_ioctl`、sysfs `enable/delay/data/vendor/cali_time`；
++传感器驱动通过 `dhall_register_hall()` / `dhall_unregister_hall()` 注册。
++
++## 五、实现策略（关键决定）
++
++原厂是「框架 + 传感器 + 电机」三层联动。既然**框架与电机也必须自己写**，
++那么「传感器 ↔ 框架」的内部 ABI 由本实现自定，**必须严格对齐的只有用户态能看到的那层**：
++
++1. `bbk_hall_core` 的 misc 设备 + sysfs（`enable`/`delay`/`data`/`vendor`/`cali_time`）
++2. `vib_pwm` 的 sysfs —— 已从原厂设备完整抓到：
++   ```
++   vib_pwm_camera_state(0=收回 1=升起 2=升起并偏转)  vib_pwm_elevator_mode
++   vib_pwm_elevator_row_shift  vib_pwm_holder_mode  vib_pwm_cali
++   vib_pwm_clear_cali_data  vib_pwm_up_down_count  vib_pwm_count  vib_pwm_dir
++   vib_pwm_freq  vib_pwm_time  vib_pwm_enable  vib_pwm_id  vib_pwm_state_init
++   vib_pwm_abort_notify                      + 对应 input 设备
++   ```
++   状态机字符串：`[LYQ-damon-vib]`、`damon enter vib_pwm_set_camera`、
++   `RESTART_CAMERA_ELEVATOR to elevator_mode %d`、`damon enter handle input
++   KEY_CAMERA_PRESS_MOVE & because: hall_up - hall_down < (cali_data.position1.hall_up_down_diff …)`；
++   校准数据在 `/mnt/vendor/persist/sensors/`（`cali_hall`、`up_down_count`）。
++
++## 六、进度
++
++| 步骤 | 内容 | 状态 |
++|---|---|---|
++| ① | `ist8801` 传感器驱动（寄存器映射已还原） | **已编译通过**，待真机确认节点/读数 |
++| ② | `mxm1120` 传感器驱动（up/down 两实例） | 待写（符号与 ioctl 已探明） |
++| ③ | BBK 霍尔框架（misc + sysfs + 校准 + 队列） | 待写 |
++| ④ | `vib_pwm` 升降电机（PWM + 状态机） | 待写（用户态接口已抓全） |
++
++每步单独提交、单独编译，都能给出可刷镜像。
