@@ -107,30 +107,5 @@ git am /path/to/patch+++/*.patch  # 按编号顺序应用
 - 触摸的 DRM 通知修复未在真机确认
 - 霍尔传感器**不产生测量值**：`0x10` 数据块恒为 0，`bbk_hall_data` 上报 `-2000`（芯片能应答
   ID 但未进入转换）。升降的开关环移动不依赖霍尔，故不影响前摄使用
-- WiFi 打不开（`Failed to load WiFi driver` / `Wifi HAL start failed`），按用户要求暂缓
+- WiFi 打不开（`Failed to load WiFi driver` / `Wifi HAL start failed`）
 
-## 交付镜像
-
-| 文件 | 说明 | md5 |
-|---|---|---|
-| `E:\s6ke\dist\boot_release.img` | **正式版**：全部修复，已关闭 bring-up 调试（SELinux 强制、无 `/proc` 调试节点） | `df22126716c7b7831fb91f41fa330a53` |
-| `E:\s6ke\dist\boot_cam11.img` | 调试版（#30），前摄升降即在此版验证 | `92bf1cf3c19978ebd36dad06c5792d17` |
-| `E:\s6ke\imgdata\boot.img` | 原厂 boot，回滚用 | — |
-
-刷入方式（本机必须进 fastbootd，bootloader 模式不接受 boot 分区写入）：
-
-```powershell
-adb reboot bootloader
-fastboot reboot fastboot        # 切到 fastbootd，此时 is-userspace: yes
-fastboot flash boot E:\s6ke\dist\boot_release.img
-fastboot reboot
-```
-
-镜像的 ramdisk 与 dtb 与原厂逐字节一致（ramdisk sha `117571ed4dce48ea`，dtb sha `864c2845fd95ad0a`），
-只替换内核本体。
-
-## 说明
-
-- 补丁均由 `git format-patch` 生成，含 `Signed-off-by`，可直接 `git am`。
-- 文档类补丁（编号 0005/0006/0008/0013/0015/0018/0019/0021/0024/0026/0038）只添加
-  `EEBBK_S6_changes.md`、`EEBBK_S6_progress.md`、逆向报告与补丁集，不含代码改动。
