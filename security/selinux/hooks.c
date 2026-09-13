@@ -6957,7 +6957,18 @@ static __init int selinux_init(void)
 	printk(KERN_INFO "SELinux:  Initializing.\n");
 
 	memset(&selinux_state, 0, sizeof(selinux_state));
+#ifdef CONFIG_BBK_DEBUG_BRINGUP
+	/*
+	 * EEBBK S6 bring-up build: start permissive so that adb shell can read
+	 * the vendor sysfs nodes (/sys/.../soc:bbk_vib_pwm, /sys/.../bbk_hall_core)
+	 * and /proc entries, which the vendor policy only allows to its own
+	 * domains.  Normal builds keep the configured mode.
+	 */
+	enforcing_set(&selinux_state, 0);
+	pr_info("SELinux:  EEBBK bring-up build, starting in permissive mode\n");
+#else
 	enforcing_set(&selinux_state, selinux_enforcing_boot);
+#endif
 	selinux_state.checkreqprot = selinux_checkreqprot_boot;
 	selinux_ss_init(&selinux_state.ss);
 	selinux_avc_init(&selinux_state.avc);

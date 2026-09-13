@@ -638,3 +638,12 @@ config VIB_PWM
 	  not part of this tree.
 
 
+config BBK_DEBUG_BRINGUP
+	bool "EEBBK bring-up helpers (world readable kernel log, permissive SELinux)"
+	default n
+	help
+	  Bring-up only: adds /proc/eebbk_kmsg, a world readable view of the kernel
+	  ring buffer, and starts SELinux in permissive mode so that adb shell can
+	  read the vendor sysfs nodes.  Do not enable this in a shipping image.
+
+
