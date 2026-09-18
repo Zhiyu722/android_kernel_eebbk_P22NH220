@@ -165,6 +165,46 @@ static int aw_dev_parse_raw_reg(struct aw_device *aw_dev,
 	return 0;
 }
 
+/*
+ * EEBBK S6 (P20H130): this ROM ships no acf file, only the older AWINIC raw
+ * register tables (aw882xx_spk_reg_l.bin and friends in /vendor/firmware).  A
+ * bare list of 16 bit register addresses and values is exactly the format
+ * aw_dev_parse_raw_reg() stores and aw_dev_reg_fw_update() programs into the
+ * chip, so such a table can be installed as profile 0 ("Music") and applied by
+ * the normal start path.  That restores the vendor settings - among them
+ * I2SCTRL 0x06 with the channel bit (0x18e8 for the left part against the
+ * generic 0x14e8 the driver would otherwise use) - which is what the
+ * amplifiers need to produce sound on this board.
+ */
+int aw_dev_load_reg_table(struct aw_device *aw_dev, uint8_t *data, uint32_t len)
+{
+	struct aw_prof_desc *prof_desc;
+
+	if (aw_dev == NULL || data == NULL || len < 4)
+		return -EINVAL;
+
+	if (aw_dev->prof_info.prof_desc == NULL) {
+		aw_dev->prof_info.prof_desc =
+			kzalloc(sizeof(struct aw_prof_desc) * AW_PROFILE_MAX,
+				GFP_KERNEL);
+		if (aw_dev->prof_info.prof_desc == NULL)
+			return -ENOMEM;
+	}
+
+	prof_desc = &aw_dev->prof_info.prof_desc[0];
+	memset(prof_desc, 0, sizeof(*prof_desc));
+
+	if (aw_dev_parse_raw_reg(aw_dev, data, len, prof_desc))
+		return -EINVAL;
+
+	prof_desc->id = 0;			/* "Music" */
+	aw_dev->prof_info.count = 1;
+	aw_dev->set_prof = 0;
+	aw_dev->cur_prof = -1;			/* force a register update */
+
+	return 0;
+}
+
 static int aw_dev_parse_raw_dsp(struct aw_device *aw_dev,
 			uint8_t *data, uint32_t data_len, struct aw_prof_desc *prof_desc)
 {

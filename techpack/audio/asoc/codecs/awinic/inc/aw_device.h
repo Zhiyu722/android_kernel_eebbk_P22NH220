@@ -192,6 +192,7 @@ int aw_device_init(struct aw_device *aw_dev, struct aw_container *aw_cfg);
 int aw_device_start(struct aw_device *aw_dev);
 int aw_device_stop(struct aw_device *aw_dev);
 int aw_dev_fw_update(struct aw_device *aw_dev,  bool prof_sw);
+int aw_dev_load_reg_table(struct aw_device *aw_dev, uint8_t *data, uint32_t len);
 
 //profile
 int aw_dev_prof_update(struct aw_device *aw_dev);
