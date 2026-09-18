@@ -615,7 +615,68 @@ static void aw882xx_firmware_acf_loaded(const struct firmware *cont, void *conte
 	aw882xx->fw_status = AW_DEV_FW_FAILED;
 	if (!cont) {
 		aw_dev_err(aw882xx->dev, "load [%s] failed!", aw882xx->aw_pa->acf_name);
-		return;
+		/*
+		 * EEBBK S6 (P20H130): this ROM ships no acf file.  Its
+		 * /vendor/firmware only carries the older AWINIC register
+		 * tables aw882xx_spk_reg_l.bin, aw882xx_spk_reg_r.bin,
+		 * aw882xx_rcv_reg_l.bin and aw882xx_rcv_reg_r.bin, which is
+		 * the scheme the vendor's shipped audio_aw882xx.ko uses.
+		 *
+		 * Without the acf the driver used to leave fw_status FAILED,
+		 * and aw882xx_start() then refused to power the amplifier up
+		 * ("fw_load failed ,can not start PA"), leaving SYSCTRL 0x04
+		 * at 0x4003 - PWDN and AMPPD set - through every playback, so
+		 * the speaker stayed silent even though the PCM started
+		 * cleanly.  Carry on with the driver's own default
+		 * initialisation: aw_dev_reg_fw_update() and
+		 * aw_dev_dsp_fw_update() both return early when there is no
+		 * profile, and aw882xx_start() ignores their return value.
+		 * The tuning itself should come from the ROM's register tables
+		 * through aw_dev_parse_reg_bin_with_hdr().
+		 */
+		{
+			const struct firmware *reg_fw = NULL;
+			const char *reg_name;
+			int addr = aw882xx->i2c->addr;
+
+			/*
+			 * 0x34 is the speaker part, 0x36 the receiver one
+			 * (see AW882XX_SPEAKER_NAME / AW882XX_RECEIVER_NAME in
+			 * the machine driver).  Try both the plain name, which
+			 * ueventd resolves in /vendor/firmware, and the absolute
+			 * path.
+			 */
+			reg_name = (addr == 0x36) ?
+				"aw882xx_rcv_reg_l.bin" : "aw882xx_spk_reg_l.bin";
+			if (request_firmware(&reg_fw, reg_name, aw882xx->dev) != 0)
+				reg_fw = NULL;
+
+			if (reg_fw == NULL &&
+			    request_firmware(&reg_fw,
+					     (addr == 0x36) ?
+					     "/vendor/firmware/aw882xx_rcv_reg_l.bin" :
+					     "/vendor/firmware/aw882xx_spk_reg_l.bin",
+					     aw882xx->dev) != 0)
+				reg_fw = NULL;
+
+			if (reg_fw != NULL &&
+			    aw_dev_load_reg_table(aw882xx->aw_pa,
+						  (uint8_t *)reg_fw->data,
+						  reg_fw->size) == 0) {
+				aw_dev_err(aw882xx->dev,
+					   "no acf on this ROM, loaded the vendor table [%s] (%zu bytes)\n",
+					   reg_name, reg_fw->size);
+				aw882xx->fw_status = AW_DEV_FW_OK;
+				release_firmware(reg_fw);
+				return;
+			}
+			if (reg_fw)
+				release_firmware(reg_fw);
+			aw_dev_err(aw882xx->dev,
+				   "no acf and no register table, starting the PA with defaults\n");
+			aw882xx->fw_status = AW_DEV_FW_OK;
+			return;
+		}
 	}
 
 	aw_dev_info(aw882xx->dev, "load [%s] , file size: [%zu]",
