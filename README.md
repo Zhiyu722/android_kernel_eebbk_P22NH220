@@ -74,7 +74,8 @@ EEBBK_S6_progress.md               过程记录
 docs/vendor-mod-attempt.md         /vendor 瘦身尝试与回滚（未采用）
 docs/bpf-gsi-feasibility.md        Android 15/16 GSI 的 BPF 可行性评估
 tools/ksu/*.py                     KernelSU 集成的锚定脚本（钩子注入 / Kconfig 适配）
-patch+++                           按主题拆分的补丁包 + 中文 README
+patch_final/                       最终补丁集：8 个主题补丁 + 67 个提交补丁 + 中文 README
+                                   （取代旧的 patch+++，见 patch_final/README.md）
 ```
 
 ---
