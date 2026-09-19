@@ -693,3 +693,62 @@ adb shell /data/local/tmp/elev set   3630   # 定值：写入 persist，重启�
   未验证的 `down_extra_permille` 改动保留为
   `patch+++/optional-elevator-down-margin.patch`，**未合入**。
 * **霍尔仍 standby**（`up:-2000 down:-2000`），闭环未恢复。
+
+---
+
+## 十、霍尔传感器：驱动层已修好，但服务侧闭环会让升降“卡一半”（2026-09-19）
+
+### 1. 结论先说
+* **硬件和驱动都没坏**：两颗 MXM1120（`magnachip@0c`=down、`magnachip@0f`=up，I2C-2）
+  ID 都是 `0x9c`，I2C 读写正常。
+* 之前霍尔一直“standby（`bbk_hall_data` 显示 -2000）”是**本仓库驱动的有意行为**：
+  `drivers/input/misc/mxm1120.c` 的 `m1120_set_operation_mode()` 只写了模式位 `0x40`，
+  没有置原厂的 START 位（`mode | 0x09`），芯片因此从不开始转换，
+  `0x10` 块的 DRDY（bit0）永远为 0 → 每个采样都被判为无效。
+* 置上 START 后**霍尔立即正常工作**（见下），但一旦有有效采样，
+  `com.eebbk.camera` 的竖升只会到 **MID（约 70%）就停住**（用户所说“卡一半”），
+  这正是当年把霍尔留在 standby 的原因。服务侧（camera 服务内的
+  `EEBBK/ElevatorCmdQueThread`）我们改不了，所以**霍尔改动暂不合入**。
+
+### 2. 实测：置 START 后霍尔数据有效且随位置变化
+`opmode 0x49`（= `0x40 | 0x09`）后，`/sys/bus/i2c/drivers/mxm1120/…/dump` 的 `0x10` 块
+读到 `[10]=01`（DRDY 置位），`bbk_hall_data` 不再是 -2000：
+
+| 升降位置 | up | down |
+|---|---|---|
+| DOWN (0) | 1 | -721 |
+| MID (1) | 1 | -542 |
+| FULL (2) | -513 | -515 |
+| HOLDER (7) | -513 | -514 |
+| 再回 DOWN | 1 | -723（可复现） |
+
+### 3. 过程中发现并修正的一件事
+之前为了改行程时间用 `SET_CALI` 持久化时，把同一块 56 字节 blob 里
+**霍尔位置标定点写成了 0**（原本是负值）。虽然实测它**不是**“卡一半”的原因
+（重建标定后 App 仍然卡一半），但 0 值标定本身是错的，现已按上表实测值重建并写回
+`/mnt/vendor/persist/sensors/cali_hall`：
+
+```
+pos0   up=1  down=-721  diff=722      pos1   up=1  down=-718  diff=719
+pos24  up=1  down=-659  diff=660      pos6   up=1  down=-706  diff=707
+pos48  up=1  down=-598  diff=599      pos696 up=1  down=-542  diff=543
+cali_time = 3630
+```
+
+写 blob 的工具：`/data/local/tmp/elev setfile <blob>`（源码见 `patch+++/tools/elev.c`）。
+
+### 4. 顺便解决：内核重编后“卡在开机画面”的原因
+仓库自带的 `build_eebbk_clang11.sh` **能编出正常开机的内核**（本次实测
+`boot_hall.img`，内核 `#1`，正常启动）。之前两次卡开机是我用临时 `make` 命令
+（复用既有 `out_native/.config`、没有先删 out 目录、没有走脚本的两遍 `olddefconfig`
+与 `CONFIG_MODULE_SIG_FORCE` 处理）造成的构建状态问题。
+**以后一律用该脚本构建**，配置用 `arch/arm64/configs/` 下的文件
+（新增 `h130_debug.config` = 带 `CONFIG_BBK_DEBUG_BRINGUP=y` 的调试配置）。
+
+### 5. 当前状态与后续
+* 设备已刷回 `boot_elev_dbg.img`（内核 #52），霍尔回到 standby，
+  相机/升降行为与修复前一致（下降贴合靠 `cali_time=3630`）。
+* 霍尔补丁保留为 `patch+++/optional-hall-enable-start-bit.patch`，**未合入**。
+* 若将来要让霍尔闭环生效，需要继续做：查清 camera 服务在有有效采样时为何只升到 MID
+  （可能需要补它真正调用的接口或它的状态机所依赖的节点），以及把厂家的
+  `vib_pwm_state_move_sate`/`vib_pwm_state_init` 闭环路径补全。
