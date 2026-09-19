@@ -1,0 +1,122 @@
+# EEBBK S6（P20H130 / sm6150 / sdmmagpiep）内核源码 —— 最终版
+
+| 项 | 值 |
+|---|---|
+| 设备 | EEBBK S6 学习平板（adb `7013T3603C41X`，fastboot `2fa7c794`，已解锁） |
+| 内核基线 | `4.14.190-perf`，QCOM **msm-4.14**（CAF），`sdmmagpiep` |
+| 工具链 | clang **11.1.0-6** + **lld 11.1.0**（不用 GNU ld：2.38 会把 `.bss.rtic` 放错位置） |
+| 仓库 | https://github.com/Zhiyu722/android_kernel_eebbk_sm6150 （`master`） |
+| 本版提交 | `b3d8129fa`（=`git log -1`） |
+
+---
+
+## 一、构建（**必须用仓库自带脚本**）
+
+```sh
+# 正式版（SELinux Enforcing，日常用）
+OUT=out_release CONFIG=h130_release.config TECHPACK_MODE=y ./build_eebbk_clang11.sh
+# 调试版（SELinux Permissive + /proc/eebbk_kmsg + KSU allow_shell）
+OUT=out_debug   CONFIG=h130_debug.config   TECHPACK_MODE=y ./build_eebbk_clang11.sh
+
+# 打包成可刷的 boot 镜像（把 wlan.ko 放进 ramdisk —— WiFi 依赖它）
+python3 <mkboot3.py> out_release/arch/arm64/boot/Image.gz boot.img <wlan.ko>
+```
+
+脚本做四件事：删掉 out 目录 → 用 `arch/arm64/configs/` 里的配置 → 跑两遍 `olddefconfig`
+（中间关掉 `CONFIG_MODULE_SIG_FORCE`）→ 先构建 `security/selinux/ init/`（KernelSU 需要的
+`flask.h`/`compile.h` 是这两处生成的）→ 编 `Image.gz`。
+
+> **不要手写 `make` 复用旧 out 目录**：本机实测这样编出来的内核**不能开机**（历史教训）。
+> `TECHPACK_MODE` 必须保持 `y`：`TECHPACK=n` 会把 ADSP loader 挡在内核之外 → 完全没声音。
+
+### 配置差异
+
+| 配置 | 用途 | 与 release 的差异 |
+|---|---|---|
+| `h130_factory.config` | 原厂基线（分析用） | — |
+| `h130_debug.config` | 调试版 | `CONFIG_BBK_DEBUG_BRINGUP=y`（Permissive + 调试节点）、`CONFIG_KSU_DEBUG=y`（`allow_shell=true`） |
+| `h130_release.config` | **正式版** | 上面两项都关 → SELinux Enforcing、`allow_shell=false` |
+
+两份 config 都带：`CONFIG_KSU=y` + `CONFIG_KSU_MANUAL_HOOK=y`（含 4.14 的六个手动钩子）、
+容器支持（`PID_NS`/`IPC_NS`/`USER_NS`/`DEVTMPFS`/`SYSVIPC`/`POSIX_MQUEUE`）。
+
+---
+
+## 二、要不要重编的对照表（这份源码修了什么）
+
+| # | 子系统 | 问题 → 修法 | 详情 |
+|---|---|---|---|
+| 1-6 | 音频 | 完全无声/机驱动/功放/寄存器表/32bit/路由 → techpack 音频栈编进内核 + awinic 改造 | `EEBBK_S6_changes.md` 一~七 |
+| 7 | 相机 | 后摄失效、缺 proc 节点 → `cam_eeprom_dev.c` 内存映射 + `/proc/driver/*Camera_info` | 同上 |
+| 8 | 触摸 | 锁屏后卡顿乱报点 → FTS 驱动改用 DRM panel notifier | 同上 |
+| 9-11 | 升降 | 完全不动/频率写不进/卡死 → 新增 `drivers/misc/gpio_pwm.c`（逆向）+ 时钟表 + 时序自修复 | 同上 |
+| 12-15 | 霍尔 | 无数据/恒 -2000/无 DRDY/「卡一半」→ 新增 `bbk_hall_core.c` + `mxm1120.c` + 卡住判据 | 第十、十一节 |
+| 16 | WiFi | 厂商 `wlan.ko` ABI 不兼容 → 自带 qcacld 编成 `wlan.ko` 放 ramdisk | 第七节 |
+| 17-19 | 构建/调试/标识 | 模块签名与 CRC、`.bss.rtic`、vermagic、调试设施、版本串 | 第七节 |
+| 20-21 | **root** | 内置 ReSukiSU（KernelSU 非 GKI 分支）+ 4 个文件六个手动钩子 | 第十二节、`KernelSU/VENDORED.md` |
+| 22 | **容器** | Droidspaces 需要的 PID/IPC namespace + devtmpfs + user ns | 第十六节 |
+
+---
+
+## 三、目录里有什么（我们自己加的东西）
+
+```
+build_eebbk_clang11.sh            构建脚本（唯一入口）
+arch/arm64/configs/h130*.config   四份配置（factory / debug / release / h130）
+KernelSU/                         内置的 ReSukiSU 源码（见 KernelSU/VENDORED.md）
+drivers/kernelsu -> ../KernelSU/kernel  （symlink，upstream 的接法）
+drivers/input/hall/bbk_hall_core.c      霍尔框架（逆向重写）
+drivers/input/misc/mxm1120.c            磁传感器驱动（新写）
+drivers/misc/gpio_pwm.c                 升降电机驱动（逆向重写）
+drivers/misc/bbk_debug.c                /proc/eebbk_kmsg、/proc/eebbk_pins
+EEBBK_S6_changes.md                技术总账（**16 节**，改了什么/为什么/怎么验证）
+EEBBK_S6_progress.md               过程记录
+docs/vendor-mod-attempt.md         /vendor 瘦身尝试与回滚（未采用）
+docs/bpf-gsi-feasibility.md        Android 15/16 GSI 的 BPF 可行性评估
+tools/ksu/*.py                     KernelSU 集成的锚定脚本（钩子注入 / Kconfig 适配）
+patch+++                           按主题拆分的补丁包 + 中文 README
+```
+
+---
+
+## 四、镜像（`dist/`，md5 用 `certutil -hashfile <img> MD5` 复核）
+
+| 文件 | 说明 | md5 |
+|---|---|---|
+| `boot_container_release.img` | **正式版（推荐日常）**：全部修复 + KSU + 容器，SELinux Enforcing | `38f947ce2a1684d2fd23051304fd8aa1` |
+| `boot_container_debug.img` | 调试版：同上但 Permissive、`allow_shell=true`、调试节点 | `111bdb921de68f6197945e52bdb28cf9` |
+| `boot_ksu_release.img` / `boot_ksu_debug.img` | 上一代（无容器支持） | `f362a2698cdcb616c51da048c293e377` / `4e99cd80950d99c0afaa45401d884c66` |
+| `boot_final_release.img` | 无 KSU 的正式版（想完全不要 root 时用） | `cbc7f63e6545af384150bd386f3ae945` |
+| `boot_hall2.img` | 回滚兜底（霍尔修复、无 KSU） | `38fdcd311b9fff3c3d29de3de3a02d17` |
+| `vendor_slim.img` | 瘦身后的 /vendor（**未采用**，刷了会卡第一屏，见 docs） | `1c0b9bf691eaa790d2be43a613f3f6c9` |
+| `ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk` | 配套的 root 管理器 App（内核版本号 35144 对得上） | `389006099b815dd588fbcd354a05fc2b` |
+
+历史实验镜像都在 `dist/历史版本/` 里，别混用。
+
+### 刷机
+
+```powershell
+adb reboot fastboot            # 走 fastbootd（is-usability: yes）
+fastboot flash boot E:\s6ke\dist\boot_container_release.img
+fastboot reboot
+```
+
+卡开机自救（按键进 fastboot 后刷回）：`E:\s6ke\dist\自救-fastboot刷回.md`，
+现成脚本 `E:\s6ke\work\tools\restore_vendor.ps1`（vendor）、
+`E:\s6ke\work\tools\flash_verify_container.ps1 -Rollback`（boot）。
+
+---
+
+## 五、已知问题（诚实清单）
+
+1. **「用久了所有声音全哑」**：根因已复现（`EEBBK_S6_changes.md` 第十三节）——
+   HAL 的扬声器保护回采流在 ASM Loopback FE 上没有后端 DAI，必然失败 →
+   `iv_feedback_count` 泄漏 → 扬声器路由卡死，**重启恢复**。
+   闭源 HAL 里的计数改不了，可行修法：把 `/vendor/build.prop` 的
+   `vendor.audio.feature.spkr_prot.enable` 改成 `false`（用 KSU 模块 bind-mount 覆盖最稳，未做）。
+2. **Android 15/16 GSI**：AOSP 已强制内核 ≥ 5.4（`NetBpfLoad: enforce kernel 5.4`），
+   本树只有 4.14 时代的 BPF（无 BTF/ringbuf/bpf_link/JMP32/新 verifier），
+   移植量参考同类机型 **约 1444 个提交**，详见 `docs/bpf-gsi-feasibility.md`。
+3. **/vendor 瘦身**：镜像本身是对的（逐文件比对只差 26 个 APK + build.prop 一行），
+   但刷入卡第一屏（verity 未同步 / 写入被中断），已回滚，`docs/vendor-mod-attempt.md`。
+4. 厂家下降闭环重试（`add_time`）未实现，下降贴合靠 `cali_time=3630` 标定。
