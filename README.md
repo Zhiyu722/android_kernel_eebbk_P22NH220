@@ -93,8 +93,9 @@ patch+++                           按主题拆分的补丁包 + 中文 README
 
 历史实验镜像都在 `dist/history/` 里（98 个文件、约 1.7 GB），别混用。
 
-**本版源码包**：`E:\s6ke\dist\android_kernel_eebbk_sm6150_final_47a35b88b.zip`
-（247081279 字节 = 236 MiB，79542 个文件，md5 `d57537cbddf2a98cfd52a6cf310b9022`，即本仓库 `47a35b88b` 提交的 `git archive`）。
+**本版源码包**：`E:\s6ke\dist\android_kernel_eebbk_sm6150_final_<提交号>.zip`，
+由本提交直接 `git archive HEAD` 生成（247 MB / 79542 个文件；zip 的 md5 无法写进它自己，
+以交付说明里给出的为准）。对应提交见文首「本版提交」。
 
 ### 刷机
 
