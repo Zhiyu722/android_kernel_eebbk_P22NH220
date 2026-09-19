@@ -91,7 +91,10 @@ patch+++                           按主题拆分的补丁包 + 中文 README
 | `vendor_slim.img` | 瘦身后的 /vendor（**未采用**，刷了会卡第一屏，见 docs） | `1c0b9bf691eaa790d2be43a613f3f6c9` |
 | `ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk` | 配套的 root 管理器 App（内核版本号 35144 对得上） | `389006099b815dd588fbcd354a05fc2b` |
 
-历史实验镜像都在 `dist/历史版本/` 里，别混用。
+历史实验镜像都在 `dist/history/` 里（98 个文件、约 1.7 GB），别混用。
+
+**本版源码包**：`E:\s6ke\dist\android_kernel_eebbk_sm6150_final_47a35b88b.zip`
+（247081279 字节 = 236 MiB，79542 个文件，md5 `d57537cbddf2a98cfd52a6cf310b9022`，即本仓库 `47a35b88b` 提交的 `git archive`）。
 
 ### 刷机
 
