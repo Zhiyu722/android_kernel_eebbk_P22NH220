@@ -1011,3 +1011,71 @@ E disable_snd_device: iv_feedback_count = 1, can't stop feedback!
 * 量级参考（实测）：小米 sm8250 的 `backport-5.10-bpf` 相对其 A15 分支 **+1444 提交**；
   MTK 天玑 1200（**同是 4.14**）的 `android_kernel_aresin` A16 分支已含 `btf.c`、`local_storage.c` 等。
 * 建议：**先用 A13/A14 GSI 验证非 BPF 门槛**（vendor API level / VNDK / OEM HAL），再决定是否开工 BPF 大移植。
+
+## 十六、容器支持（Droidspaces v6.5.0 需求）：PID/IPC namespace + devtmpfs + user namespace（2026-09-19）
+
+### 1. 问题
+
+Droidspaces v6.5.0 的运行要求自检报出 4 项缺失：
+
+```
+[MUST]      [✗] PID namespace      Process ID namespace isolation
+[MUST]      [✗] IPC namespace      Inter-process communication isolation
+[RECOMMEND] [✗] devtmpfs support   Required for hardware access mode
+[OPTIONAL]  [✗] User namespace     CONFIG_USER_NS (--allow-userns / Docker / bwrap)
+```
+
+本树原本：`CONFIG_NAMESPACES=y`、`UTS_NS=y`、`NET_NS=y`、`CGROUPS=y`、`MEMCG=y`、`SECCOMP=y` 都有，
+但 `PID_NS`、`USER_NS`、`DEVTMPFS` 被关，`SYSVIPC` 也关着 —— 而 `IPC_NS` 的 Kconfig 依赖是
+`depends on (SYSVIPC || POSIX_MQUEUE)`，所以 IPC namespace 是**连带**缺失的。
+
+### 2. 改动（两个 config 文件末尾追加同一块）
+
+```diff
++CONFIG_NAMESPACES=y
++CONFIG_UTS_NS=y
++CONFIG_NET_NS=y
++CONFIG_PID_NS=y
++CONFIG_IPC_NS=y
++CONFIG_USER_NS=y
++CONFIG_SYSVIPC=y          # IPC_NS 的依赖
++CONFIG_SYSVIPC_SYSCTL=y
++CONFIG_POSIX_MQUEUE=y     # 容器里常用的 POSIX 消息队列
++CONFIG_POSIX_MQUEUE_SYSCTL=y
++CONFIG_DEVTMPFS=y
++# CONFIG_DEVTMPFS_MOUNT is not set
+```
+
+**为什么 `DEVTMPFS_MOUNT` 故意不打开**：打开后内核会在挂载 rootfs 后自动把 devtmpfs 挂到 `/dev`，
+和 Android init 自己挂的 tmpfs `/dev` 冲突；`DEVTMPFS=y` 已经足够让容器里 `mount -t devtmpfs` 成功。
+
+### 3. 编译期验证
+
+先只编受影响的那些对象，确认没有报错（都过）：
+
+```
+kernel/nsproxy.o kernel/pid.o kernel/pid_namespace.o kernel/user_namespace.o kernel/utsname.o
+ipc/msg.o ipc/sem.o ipc/shm.o ipc/mqueue.o ipc/util.o ipc/namespace.o
+fs/namespace.o fs/proc/namespaces.o drivers/base/devtmpfs.o
+kernel/cgroup/cgroup.o kernel/cgroup/namespace.o
+```
+
+`olddefconfig` 后的解析结果：
+
+```
+CONFIG_SYSVIPC=y            CONFIG_SYSVIPC_SYSCTL=y
+CONFIG_POSIX_MQUEUE=y       CONFIG_POSIX_MQUEUE_SYSCTL=y
+CONFIG_NAMESPACES=y         CONFIG_UTS_NS=y    CONFIG_NET_NS=y
+CONFIG_PID_NS=y             CONFIG_IPC_NS=y    CONFIG_USER_NS=y
+CONFIG_DEVTMPFS=y           # CONFIG_DEVTMPFS_MOUNT is not set
+CONFIG_CGROUPS=y            CONFIG_MEMCG=y     CONFIG_SECCOMP=y
+```
+
+### 4. 真机验证方式（不依赖 App）
+
+* `ls /proc/self/ns/` 应出现 `cgroup ipc mnt net pid pid_for_children user uts`（改之前只有 cgroup/mnt/net/uts）；
+* `cat /proc/filesystems | grep devtmpfs` 应列出 devtmpfs；
+* `cat /proc/sys/kernel/sem`、`cat /proc/sys/kernel/shmmax` 有值（SysV IPC 生效），
+  `ls /proc/sys/fs/mqueue` 非空（POSIX mqueue 生效）。
+
+> 说明：Droidspaces 的 root 一项本来就是 ✓（说明 ReSukiSU 的 root 已经在真机上跑通了）。
