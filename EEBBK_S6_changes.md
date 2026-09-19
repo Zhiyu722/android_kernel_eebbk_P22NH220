@@ -934,3 +934,80 @@ App 需要用户自己装（官方 release，与内核版本号对齐）：
 * 或者把 config 里的 `CONFIG_KSU` 改成 `# CONFIG_KSU is not set` 重编（注意 KSU 关闭后
   `KernelSU/kernel/Kbuild` 里的钩子检查不会执行，源码里的 4 处钩子留在那里也无副作用）；
 * KSU 只在内核里增加钩子，没有改 `avb`/`verity`/`vbmeta`，所以刷回原镜像就是完全恢复。
+
+## 十三、音频「用久了全哑」的根因：真机复现 + 机制（2026-09-19）
+
+### 1. 复现方法（不依赖「用很久」，随时可复现）
+
+刷当前调试镜像，清日志后连放 3 轮音乐（`com.eebbk.musicplayer`），内核与 HAL 日志同时抓：
+
+```
+# dmesg（内核）
+[ 924.188492] SM6150 ASM Loopback: ASoC: no backend DAIs enabled for SM6150 ASM Loopback
+# logcat（HAL，tag audio_hw_primary）
+D disable_snd_device: snd_device(2: speaker)
+E  snd_card_name =sm6150-wcd9375-snd-card
+D disable_snd_device: iv_feedback_count-- befor=2
+D aw_is_supported_feedback_on_device [Awinic] 2 ret=1
+D disable_snd_device: iv_feedback_count-- after=1
+E disable_snd_device: iv_feedback_count = 1, can't stop feedback!
+```
+
+### 2. 机制（已能解释全部现象）
+
+1. `vendor.audio.feature.spkr_prot.enable=true`（在 `/vendor/build.prop` 第 134 行显式打开），
+   HAL（`/vendor/lib64/hw/audio.primary.sm6150.so`）于是走扬声器保护流程：
+   `audio_route` 应用 `spkr-vi-record` 路径 → 设 `TERT_MI2S_RX_VI_FB_MUX=TERT_MI2S_TX`
+   （这个 mux 原厂内核里有，我们这棵树原本缺，已在前面的提交补回）→ 再打开一路 **capture**。
+2. 那路 capture 落在 FE `SM6150 ASM Loopback`（machine driver `techpack/audio/asoc/sm6150.c`，
+   `MSM_FRONTEND_DAI_MULTIMEDIA6`，`dynamic=1` + `dpcm_capture=1`）。DPCM 要求该方向至少挂一个后端 DAI，
+   而 vendor HAL 的 mixer 路径里**没有任何** “MultiMedia6 Mixer TERT_MI2S_TX” 这类 FE→BE 连接控制
+   （routing 表里这条路由是存在的，见 `msm-pcm-routing-v2.c` 第 23385 行），所以 `be_clients` 为空 →
+   `dpcm_fe_dai_prepare()` 直接 `-EINVAL` → 内核这句 `no backend DAIs enabled`。
+3. HAL 的 `iv_feedback_count` 因此永远回不到 0：每放一轮它就少减一次，
+   `disable_snd_device(speaker)` 判断计数非 0 就**拒绝关掉扬声器**，
+   于是扬声器路由一直卡在“已开”状态；再叠加 awinic 回采启动失败（`pcm start for TX failed`），
+   最终表现就是「用久了所有声音全哑」，重启复位后恢复。
+
+### 3. 两条可行修法（都还没在真机上收尾）
+
+| 修法 | 做法 | 状态 |
+|---|---|---|
+| ROM 侧关掉这个功能（推荐，简单） | `/vendor/build.prop` 里 `vendor.audio.feature.spkr_prot.enable=false` | 镜像已做好（`dist/vendor_slim.img`），但**刷入卡在第一屏**，已回滚，详见第十四节 |
+| 不刷分区 | 用 KSU 模块开机 bind-mount 一份改好的 build.prop 覆盖 `/vendor/build.prop` | 待做（需要 App 装好、启用模块） |
+| 内核侧（治本但深） | 让这路 capture 能成功：自动把 FE 挂到 BE（routing 里已有 `MultiMedia6 Mixer TERT_MI2S_TX` 路由），或把该 FE 的 capture 改成非 DPCM | 未做，需要评估对其它 MultiMedia6 用例的影响 |
+
+**重要**：`iv_feedback_count` 与 `spkr_prot` 都在闭源 HAL 里（`grep -rl iv_feedback /vendor/lib64` 只命中
+`audio.primary.sm6150.so`），内核侧改不了它的计数逻辑，只能让它走不通的那条路不再被走到。
+
+---
+
+## 十四、/vendor 瘦身 + 关 speaker protection：一次尝试与回滚（2026-09-19）
+
+完整记录见 `docs/vendor-mod-attempt.md`，结论：
+
+* `/vendor/dataapp` 里 26 个预装 APK 占 **2.2 GB**（`/vendor/app` 只有 12 MB 且都是高通系统服务，不能删）。
+* 原镜像带 `shared_blocks`（Android 去重特性）→ Linux 只能**只读**挂载，无法原地改；
+  改用「只读挂载取树 → 删文件/改属性 → `mke2fs -d` 重建」的做法（实测 `mke2fs -d` **保留 security.selinux**）。
+* 产出 `dist/vendor_slim.img`：662 MiB（原 2.8 GB），md5 `1c0b9bf691eaa790d2be43a613f3f6c9`；
+  与工厂镜像逐文件对比：**除 26 个 APK 与 build.prop 一行外，权限/属主/SELinux 标签/内容差异全为 0**。
+* 刷入后**卡在第一屏**（两种可能：① 改了 vendor 但没同步 `vbmeta` → dm-verity 校验失败；
+  ② 那次刷写被会话中断，分区只写了一半）。恢复手段：按键进 fastbootd →
+  `fastboot flash vendor E:\s6ke\vendor\vendor.img` → 重启，已恢复正常（脚本 `work/tools/restore_vendor.ps1`）。
+* **当前决定：vendor 先不动**。要再试的话，先在 fastbootd 里 `fastboot fetch` 回读比对 md5，
+  一致再重启；若是 verity 问题就先刷带 `--disable-verity --disable-verification` 的 `vbmeta`。
+
+---
+
+## 十五、Android 15/16 GSI 的 BPF 可行性评估（2026-09-19）
+
+完整评估见 `docs/bpf-gsi-feasibility.md`，要点：
+
+* AOSP `platform/packages/modules/Connectivity` 提交 **"NetBpfLoad: enforce kernel 5.4 for Android W"**
+  （Merged 2025-01-14，change 3285058）→ 内核 < 5.4 直接拒绝加载 BPF，表现为一屏重启（`bpfloader-failed`）。
+* 我们这棵树**帖子里列的 8 项 defconfig 依赖全都有**；缺的是 5.x 那一整套：
+  BTF、`RINGBUF`/`SK_STORAGE`/`QUEUE/STACK`/`STRUCT_OPS`、`bpf_link`、`BPF_JMP32`、
+  `BPF_PROG_TYPE_EXT/LSM`，以及 5.x 的 verifier（`bpf()` 目前只有 `MAP_CREATE`/`PROG_LOAD`/`PROG_TEST_RUN`）。
+* 量级参考（实测）：小米 sm8250 的 `backport-5.10-bpf` 相对其 A15 分支 **+1444 提交**；
+  MTK 天玑 1200（**同是 4.14**）的 `android_kernel_aresin` A16 分支已含 `btf.c`、`local_storage.c` 等。
+* 建议：**先用 A13/A14 GSI 验证非 BPF 门槛**（vendor API level / VNDK / OEM HAL），再决定是否开工 BPF 大移植。
