@@ -72,6 +72,17 @@ sed -i 's/^CONFIG_MODULE_SIG_FORCE=y/# CONFIG_MODULE_SIG_FORCE is not set/' "$OU
 make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" olddefconfig
 grep -E '^CONFIG_MODVERSIONS|^# CONFIG_MODULE_SIG_FORCE' "$OUT/.config"
 
+# Drivers/kernelsu (ReSukiSU) pulls in kernel-internal headers that kbuild only
+# generates while building, so with -j it can race with the directories that
+# create them:
+#   * security/selinux/flask.h + av_permissions.h (security/selinux/Makefile)
+#   * include/generated/compile.h                 (init/version.o)
+# Build those two directories up front; they are small and get reused below.
+echo "== pre-generate headers used by drivers/kernelsu =="
+make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" \
+	security/selinux/ init/
+ls -l "$OUT/security/selinux/flask.h" "$OUT/include/generated/compile.h"
+
 echo "== build Image.gz =="
 make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" DTC=dtc Image.gz
 
