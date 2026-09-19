@@ -1,0 +1,132 @@
+From 0dcb3ff8dd9069f1771ef7f4bc5f280f8696be2e Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 20:57:41 +0800
+Subject: [PATCH 08/40] docs: Add the touch section to the change write-up
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ EEBBK_S6_changes.md | 97 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/EEBBK_S6_changes.md b/EEBBK_S6_changes.md
+index 333993eca..4be15c847 100755
+--- a/EEBBK_S6_changes.md
++++ b/EEBBK_S6_changes.md
+@@ -375,7 +375,98 @@ TECHPACK=n → 内核无 adsp-loader.c → qcom,adsp-loader 节点无人绑定
+ 
+ 这些都不影响本次两项修复，但如果后续需要完全还原原厂功能，需要补齐上述驱动。
+ 
+-## 五、升降前摄（“打开相机自动升起”）结论
++## 五、触摸：锁屏后卡顿 + 触摸乱上报（第三项修复）
++
++症状：**锁屏后系统非常卡**，日志里**触摸事件乱上报**。
++
++### 根因
++
++`drivers/input/touchscreen/focaltech_touch/focaltech_core.c` 用 `#if/#elif` 链
++选择「熄屏通知器」：
++
++```c
++#if defined(CONFIG_FB)
++    ts_data->fb_notif.notifier_call = fb_notifier_callback;
++    ret = fb_register_client(&ts_data->fb_notif);          /* ← 实际编译进了这条 */
++#elif defined(CONFIG_DRM)
++    ts_data->fb_notif.notifier_call = drm_notifier_callback;
++#if defined(CONFIG_DRM_PANEL)
++    ... drm_panel_notifier_register(active_panel, ...)
++#else
++    ... msm_drm_register_client(&ts_data->fb_notif)
++#endif
++#endif
++```
++
++本内核 **`CONFIG_FB=y` 与 `CONFIG_DRM=y` 同时开启**，屏幕由 **MSM DRM（SDE）** 驱动，
++所以注册的是**旧的 fb_notifier** —— MSM DRM 显示**永远不会触发** FB blank 事件。
++本树里的直接证据：
++
++```
++drivers/gpu/drm/msm/msm_atomic.c:266  msm_drm_notifier_call_chain(MSM_DRM_EARLY_EVENT_BLANK, ...)
++drivers/gpu/drm/msm/msm_atomic.c:287  msm_drm_notifier_call_chain(MSM_DRM_EVENT_BLANK, ...)
++```
++
++而 `fts_ts_suspend()` / `fts_ts_resume()` 的调用点**只**在这些通知回调里
++（`fb_notifier_callback` / `drm_notifier_callback`），i2c 驱动上也没有
++`dev_pm_ops`（`FTS_PATCH_COMERR_PM == 0`）：
++
++```c
++#if defined(CONFIG_PM) && FTS_PATCH_COMERR_PM
++        .pm = &fts_dev_pm_ops,
++#endif
++```
++
++结果熄屏后触摸控制器**一直醒着、IRQ 一直开着**：
++
++* IRQ 持续触发 → 线程化中断反复做 i2c 读 → CPU 被反复唤醒 → **锁屏后很卡**；
++* 读回的脏数据被当成触摸点上报 → **触摸乱上报**。
++
++> 驱动来源：`README.txt` 自述「取自 Firefly RK3399 公开源码…**本驱动在 EEBBK S5 测试可用**
++> By XiKoTaSu」，是从 S5 移植的第三方通用版本，显示框架不匹配正是此类移植的典型坑。
++
++### 修法
++
++按**本树自己的既有约定**判别与注册，不引入新机制：
++
++* `st/fts.c`：只在 `CONFIG_FB_MSM`（旧 MSM framebuffer）时才走 fb 路径；
++* `hxchipset/himax_common.c`：`#ifdef CONFIG_DRM` + `msm_drm_register_client()`。
++
++因此把判别条件由 `CONFIG_FB` 改为 `CONFIG_FB_MSM`，注册 msm_drm 客户端：
++
++```c
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++    ts_data->fb_notif.notifier_call = drm_notifier_callback;
++    ret = msm_drm_register_client(&ts_data->fb_notif);
++    if (ret)
++        FTS_ERROR("[DRM]Unable to register msm_drm notifier: %d\n", ret);
++    else
++        FTS_INFO("[DRM]msm_drm notifier registered for blank/unblank");
++```
++
++同时修掉两个同源问题：
++
++* `<linux/msm_drm_notify.h>` 原先只被包含在**不可达**的 `CONFIG_DRM_PANEL` 的 `#else` 分支里；
++* 只匹配 `DRM_PANEL_*` 事件的那个 `drm_notifier_callback` 变体被排除，改用匹配
++  `MSM_DRM_*` 事件的变体（与 `msm_drm_register_client()` 配对）。
++
++### 验证（离线，已通过）
++
++```
++focaltech_core.o 重新编译：0 warning / 0 error
++Image.gz 内：
++  msm_drm_register_client / msm_drm_unregister_client      1 / 1
++  msm_drm notifier registered for blank/unblank            1
++  Unable to register fb_notifier                           0   ← 旧 fb 路径已不再编译
++  adsp-loader 2 · driver/BackCamera_info 1                      ← 音频/相机修复未受影响
++打包：kernel == Image.gz / ramdisk == factory / dtb == factory   → ALL CHECKS PASSED
++```
++
++刷入后锁屏应能看到 `logcat -s FTS_TS` 出现
++`[DRM]msm_drm notifier registered for blank/unblank` 与 `DRM event:…,blank:…`，
++且熄屏后 `getevent -lt /dev/input/event2` 不再有事件。
++
++## 六、升降前摄（“打开相机自动升起”）结论
+ 
+ **这套逻辑确实在内核里，但驱动源码不在本仓库、也不在任何公开仓库中。**
+ 
+@@ -438,7 +529,7 @@ bbk_hall_vendor
+ 
+ ---
+ 
+-## 六、真机刷机排查全过程（最终结论：`TECHPACK=n` 把 ADSP loader 挡在内核之外）
++## 七、真机刷机排查全过程（最终结论：`TECHPACK=n` 把 ADSP loader 挡在内核之外）
+ 
+ 按顺序踩到并解决/定位的问题，全部有真机证据：
+ 
+@@ -493,7 +584,7 @@ bbk_hall_vendor
+ 
+ ---
+ 
+-## 七、升降前摄接口（供后续逆向重写驱动）
++## 八、升降前摄接口（供后续逆向重写驱动）
+ 
+ 真机原厂内核下抓到的完整接口：
+ 

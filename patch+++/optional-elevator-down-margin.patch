@@ -1,0 +1,82 @@
+diff --git a/drivers/misc/gpio_pwm.c b/drivers/misc/gpio_pwm.c
+index a22b1f8b8..da0c1d509 100755
+--- a/drivers/misc/gpio_pwm.c
++++ b/drivers/misc/gpio_pwm.c
+@@ -166,6 +166,38 @@ static int mhall_control5 = 3;		/* retry_time for the holder moves */
+ static int mhall_control6 = 20;		/* add_time for the holder moves */
+ static int mhall_control7 = 2839;	/* all_time, a full travel */
+ 
++/*
++ * Extra travel for a downward move, in 1/1000 of the commanded travel.  The
++ * factory closes the retract loop on the hall sensors (retry with add_time), so
++ * its downward move reaches the bottom stop; with the halls in standby this
++ * open loop ends a few percent short and the camera stays slightly raised.
++ * Writable (0666) so the value can be tuned from adb shell.
++ */
++static int down_extra_permille = 60;
++
++static ssize_t vib_pwm_down_extra_show(struct device *dev,
++				       struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%d\n", down_extra_permille);
++}
++
++static ssize_t vib_pwm_down_extra_store(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	int v;
++
++	if (kstrtoint(buf, 10, &v))
++		return count;
++	down_extra_permille = clamp(v, 0, 1000);
++	dev_info(dev, "down_extra_permille set to %d\n", down_extra_permille);
++	return count;
++}
++
++/* 0666 on purpose: the value is tuned from adb shell during bring-up */
++static DEVICE_ATTR(vib_pwm_down_extra, 0666, vib_pwm_down_extra_show,
++		   vib_pwm_down_extra_store);
++
+ module_param(mhall_control_up, int, 0664);
+ module_param(mhall_control_down, int, 0664);
+ module_param(mhall_control2, int, 0664);
+@@ -595,11 +627,14 @@ static unsigned int vib_pwm_time_for(int want, int cur)
+ 		if (cur == CAM_STATE_MID)
+ 			return (full - mid) - correction;
+ 		return full - correction;
+-	case CAM_STATE_DOWN:
++	case CAM_STATE_DOWN: {
+ 		/* [RE] (0,1) takes the mid duration, (0,2) and (0,7) a full one */
+-		if (cur == CAM_STATE_MID)
+-			return mid;
+-		return full;
++		unsigned int t = (cur == CAM_STATE_MID) ? mid : full;
++
++		/* the retract needs slightly longer than the raise for the same
++		 * travel; the factory hides this behind its hall retry. */
++		return t + t * down_extra_permille / 1000;
++	}
+ 	default:
+ 		return full;
+ 	}
+@@ -667,9 +702,9 @@ static int vib_pwm_move_to(struct vib_pwm *d, int want)
+ 	}
+ 
+ 	dev_info(d->dev,
+-		 "%s: want %d, current %d -> %s for %u ms, retry %d\n",
++		 "%s: want %d, current %d -> %s for %u ms, retry %d (down margin %d/1000)\n",
+ 		 __func__, want, cur, d->enable == 1 ? "up" : "down",
+-		 d->time_ms, d->retry_time);
++		 d->time_ms, d->retry_time, down_extra_permille);
+ 
+ 	return vib_pwm_set_camera_state(d);
+ }
+@@ -1298,6 +1333,7 @@ static struct attribute *vib_pwm_attrs[] = {
+ 	&dev_attr_vib_pwm_cali.attr,
+ 	&dev_attr_vib_pwm_up_down_count.attr,
+ 	&dev_attr_vib_pwm_clear_cali_data.attr,
++	&dev_attr_vib_pwm_down_extra.attr,
+ #ifdef CONFIG_BBK_DEBUG_BRINGUP
+ 	&dev_attr_vib_pwm_debug.attr,
+ #endif

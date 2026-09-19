@@ -1,0 +1,143 @@
+From 840cc5a4241d81ea7ea389ad13c773a2ebf57c2c Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:35:31 +0800
+Subject: [PATCH 28/40] input: misc: mxm1120: Accept the id this board actually
+ reports
+
+The bring-up image finally produced the kernel log, and it explains why the hall
+sensors never bound in the shipping builds:
+
+    mxm1120 2-000c: m1120_init_device: current device id(0x41) is not
+                    M1120 device id(0x9C)
+
+Both instances, on i2c 0x0c and 0x0f, answer 0x41 at register 0x00, and they do
+so over a working i2c link - the reads succeed, the value is just not the one the
+reconstructed driver expected.  0x9C came from reading the factory disassembly;
+the hardware is the authority here, so expect 0x41 and only warn on anything
+else, which keeps a different variant of the part usable.
+
+With that, the whole chain comes up on the device: m1120_down and m1120_up
+register, the hall framework logs "register up down hall Done,so add platform
+devices" and "bbk_hall_core_probe success", /dev/bbk_hall_core appears with its
+six attributes, bbk_hall_vendor reports "up:up-mxm1120 down:down-mxm1120", and
+BBK's own userspace already talks to it - the log shows
+BBK_HALL_CORE_IOCTL_TRANS_CALI, hall_core_restore_count reading "4-4", and
+set_vib_all_time() reaching the motor driver, whose all_time then reads 2790.
+
+The strict vendor checks are restored for every build (the bring-up relaxations
+stay inside their #ifdef), and the bring-up log node now returns EOF after one
+snapshot so that "cat /proc/eebbk_kmsg" terminates.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ drivers/input/misc/ist8801.c |  2 +-
+ drivers/input/misc/mxm1120.c | 40 ++++++++++--------------------------
+ drivers/misc/bbk_debug.c     |  8 ++++++++
+ 3 files changed, 20 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/input/misc/ist8801.c b/drivers/input/misc/ist8801.c
+index c75a1b523..59dfae254 100755
+--- a/drivers/input/misc/ist8801.c
++++ b/drivers/input/misc/ist8801.c
+@@ -346,7 +346,7 @@ static int ist8801_i2c_probe(struct i2c_client *client,
+ 	ist8801_parse_dt(d);
+ 
+ #ifdef CONFIG_BBK_DEBUG_BRINGUP
+-	/* bring-up: a single unreadable register must not stop the probe */
++	/* bring-up: the part on this board does not answer, see the notes */
+ 	ret = ist8801_reset_device(d);
+ 	if (ret)
+ 		dev_err(d->dev, "%s : ist8801_reset_device fail(%d), continuing anyway\n",
+diff --git a/drivers/input/misc/mxm1120.c b/drivers/input/misc/mxm1120.c
+index f2d5984b5..2293e64a4 100644
+--- a/drivers/input/misc/mxm1120.c
++++ b/drivers/input/misc/mxm1120.c
+@@ -90,7 +90,13 @@ extern void bbk_hall_core_unregister_device(struct hall_dev *dev);
+ #define M1120_REG_OPMODE	0x08
+ #define M1120_REG_DATA		0x10
+ 
+-#define M1120_ID_EXPECT		0x9c
++/*
++ * [RE] the factory driver's own id check compared against this value; on the
++ * device both instances (i2c 0x0c and 0x0f) answer 0x41, which is what the
++ * driver must accept.  A different value is only reported, because the part
++ * may be a variant of the same family.
++ */
++#define M1120_ID_EXPECT		0x41
+ #define M1120_DATA_LEN		3
+ #define M1120_OP_MEASUREMENT	0x40
+ 
+@@ -168,21 +174,6 @@ static int m1120_init_device(struct m1120_data *d)
+ 	int ret;
+ 
+ 	/* [RE] the exact sequence the vendor probe used */
+-#ifdef CONFIG_BBK_DEBUG_BRINGUP
+-	/* bring-up: a single unreadable register must not stop the probe */
+-	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL2, 0x01);
+-	if (ret)
+-		dev_err(d->dev, "%s: write 0x07 failed (%d), continuing anyway\n",
+-			__func__, ret);
+-
+-	ret = m1120_get_id(d, &d->device_id);
+-	if (ret)
+-		dev_err(d->dev, "%s: read id failed (%d), continuing anyway\n",
+-			__func__, ret);
+-	else if (d->device_id != M1120_ID_EXPECT)
+-		dev_err(d->dev, "%s: current device id(0x%02X) is not M1120 device id(0x%02X)\n",
+-			__func__, d->device_id, M1120_ID_EXPECT);
+-#else
+ 	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL2, 0x01);
+ 	if (ret)
+ 		return ret;
+@@ -190,12 +181,10 @@ static int m1120_init_device(struct m1120_data *d)
+ 	ret = m1120_get_id(d, &d->device_id);
+ 	if (ret)
+ 		return ret;
+-	if (d->device_id != M1120_ID_EXPECT) {
+-		dev_err(d->dev, "%s: current device id(0x%02X) is not M1120 device id(0x%02X)\n",
+-			__func__, d->device_id, M1120_ID_EXPECT);
+-		return -ENODEV;
+-	}
+-#endif
++	if (d->device_id != M1120_ID_EXPECT)
++		dev_warn(d->dev,
++			 "%s: device id 0x%02X, expected 0x%02X, continuing\n",
++			 __func__, d->device_id, M1120_ID_EXPECT);
+ 
+ 	ret = m1120_i2c_set_reg(d, M1120_REG_ID, 0x40);
+ 	if (ret)
+@@ -551,15 +540,8 @@ static int m1120_i2c_drv_probe(struct i2c_client *client,
+ 
+ 	if (!i2c_check_functionality(client->adapter,
+ 				     I2C_FUNC_SMBUS_I2C_BLOCK | I2C_FUNC_I2C)) {
+-#ifdef CONFIG_BBK_DEBUG_BRINGUP
+-		/* bring-up: warn instead of refusing to probe */
+-		dev_err(d->dev,
+-			"%s: adapter does not advertise SMBUS_I2C_BLOCK, continuing anyway\n",
+-			__func__);
+-#else
+ 		dev_err(d->dev, "%s: i2c_check_functionality was failed\n", __func__);
+ 		return -EOPNOTSUPP;
+-#endif
+ 	}
+ 
+ 	/* optional supplies: the vendor probe requested two regulators */
+diff --git a/drivers/misc/bbk_debug.c b/drivers/misc/bbk_debug.c
+index 2bb4b9075..f54277505 100755
+--- a/drivers/misc/bbk_debug.c
++++ b/drivers/misc/bbk_debug.c
+@@ -50,6 +50,14 @@ static ssize_t bbk_kmsg_read(struct file *file, char __user *ubuf,
+ 	if (!count)
+ 		return 0;
+ 
++	/*
++	 * READ_ALL always hands back the whole ring buffer, so without this a
++	 * reader like cat would loop for ever.  One snapshot per open is what a
++	 * bring-up node needs.
++	 */
++	if (*ppos)
++		return 0;
++
+ 	ret = do_syslog(SYSLOG_ACTION_READ_ALL, ubuf, count, SYSLOG_FROM_PROC);
+ 	if (ret > 0)
+ 		*ppos += ret;

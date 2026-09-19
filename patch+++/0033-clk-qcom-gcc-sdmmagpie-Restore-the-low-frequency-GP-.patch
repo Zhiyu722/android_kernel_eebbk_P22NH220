@@ -1,0 +1,78 @@
+From 7f916bc91a8438a01c704edc8f17151b6e7e7bfa Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 12:47:59 +0800
+Subject: [PATCH 33/40] clk: qcom: gcc-sdmmagpie: Restore the low frequency GP
+ clock entries
+
+The camera elevator chopper is gcc_gp2_clk, the branch of gcc_gp2_clk_src
+behind <&gcc GCC_GP2_CLK>.  This tree carries the generic table for that RCG,
+which only offers 19.2 MHz and up, so the clk_set_rate() the elevator driver
+performs on the branch - the same call the vendor driver makes - silently
+leaves the pin at 19.2 MHz.  A motor driver fed 19.2 MHz never switches its
+outputs, so the mechanism only hummed and the front camera never came out: the
+stock firmware had the same hole.
+
+The factory kernel's table for this RCG was recovered from the vmlinux symbol
+data (three gcc_gp2_clk_src copies exist, one per compiled GCC driver; the
+sdmmagpie one is the table in use on this board) and restored here.  All the low
+entries run from bi_tcxo through the half integer divider h and the mnd ratio
+m/n, so clk_rcg2_calc_rate() = (parent / h) * m / n gives
+
+    19200000 / 16 * 2 / 75  = 32000    a normal move
+    19200000 / 16 * 4 / 250 = 19200    first stage of a long move
+    19200000 / 15 * 8 / 246 = 41626    second stage of a long move
+
+which is exactly the set of rates drivers/misc/gpio_pwm.c asks for.  Verified
+on the device: gcc_gp2_clk_src reports 32000 Hz during a move and the elevator
+now raises the front camera.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ drivers/clk/qcom/gcc-sdmmagpie.c | 33 ++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/clk/qcom/gcc-sdmmagpie.c b/drivers/clk/qcom/gcc-sdmmagpie.c
+index 591d76fb0..46cfba5d0 100644
+--- a/drivers/clk/qcom/gcc-sdmmagpie.c
++++ b/drivers/clk/qcom/gcc-sdmmagpie.c
+@@ -330,7 +330,40 @@ static struct clk_rcg2 gcc_cpuss_rbcpr_clk_src = {
+ 	},
+ };
+ 
++/*
++ * [RE] Restored from the factory kernel: this table also carries the low
++ * frequencies the EEBBK S6 camera elevator chopper runs at.  They all come from
++ * bi_tcxo through the half integer divider h and the mnd ratio m/n, so with
++ * clk_rcg2_calc_rate() = (parent / h) * m / n:
++ *
++ *     19200000 / 16 * 2 / 75  = 32000   a normal move
++ *     19200000 / 16 * 4 / 250 = 19200   first stage of a long move
++ *     19200000 / 15 * 8 / 246 = 41626   second stage of a long move
++ *
++ * which is exactly what drivers/misc/gpio_pwm.c asks for.  Without them the RCG
++ * can only produce 19.2 MHz and up, clk_set_rate() on the gcc_gp2_clk branch
++ * silently leaves the pin at 19.2 MHz, and the motor driver - which cannot
++ * switch that fast - only hums: the elevator never moved, in this kernel or in
++ * the vendor's own driver, which asks for the same three rates.
++ */
+ static const struct freq_tbl ftbl_gcc_gp1_clk_src[] = {
++	F(4800, P_BI_TCXO, 16, 1, 250),
++	F(8000, P_BI_TCXO, 16, 1, 150),
++	F(9600, P_BI_TCXO, 16, 2, 250),
++	F(10000, P_BI_TCXO, 16, 1, 120),
++	F(10406, P_BI_TCXO, 15, 2, 246),
++	F(12800, P_BI_TCXO, 10, 1, 150),
++	F(16000, P_BI_TCXO, 16, 1, 75),
++	F(19200, P_BI_TCXO, 16, 4, 250),
++	F(20800, P_BI_TCXO, 15, 4, 246),
++	F(25600, P_BI_TCXO, 10, 2, 150),
++	F(28800, P_BI_TCXO, 16, 3, 125),
++	F(32000, P_BI_TCXO, 16, 2, 75),
++	F(38400, P_BI_TCXO, 8, 2, 125),
++	F(40000, P_BI_TCXO, 16, 4, 120),
++	F(41600, P_BI_TCXO, 15, 8, 246),
++	F(48000, P_BI_TCXO, 16, 3, 75),
++	F(64000, P_BI_TCXO, 16, 4, 75),
+ 	F(19200000, P_BI_TCXO, 1, 0, 0),
+ 	F(25000000, P_GPLL0_OUT_EVEN, 12, 0, 0),
+ 	F(50000000, P_GPLL0_OUT_EVEN, 6, 0, 0),

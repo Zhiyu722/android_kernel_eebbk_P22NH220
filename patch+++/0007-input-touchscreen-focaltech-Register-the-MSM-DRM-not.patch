@@ -1,0 +1,442 @@
+From 1eaa23fa9e80f8b96502fafebe241850db597c7d Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 20:55:54 +0800
+Subject: [PATCH 07/40] input: touchscreen: focaltech: Register the MSM DRM
+ notifier
+
+The driver picks its display-blank notifier with
+
+    #if defined(CONFIG_FB) ... #elif defined(CONFIG_DRM) ...
+
+This kernel has CONFIG_FB=y and CONFIG_DRM=y while the display is MSM DRM
+(SDE), so the legacy fb_notifier was registered - and an MSM DRM display never
+fires FB blank events (it calls msm_drm_notifier_call_chain() from
+msm_atomic.c).  fts_ts_suspend()/fts_ts_resume(), whose only callers are those
+callbacks, were therefore never called, and the i2c driver has no dev_pm_ops
+either (FTS_PATCH_COMERR_PM == 0).
+
+With the screen off the touch controller stayed awake with its IRQ enabled:
+the threaded handler ran continuously doing i2c reads (constant CPU wakeups,
+i.e. the system becoming very laggy after locking) and whatever it read was
+reported as touch points (erratic touch reports).
+
+Discriminate on CONFIG_FB_MSM like st/fts.c in this tree and register the MSM
+DRM client like hxchipset/himax_common.c.  Also fixes the matching header
+include (linux/msm_drm_notify.h was only reachable in the dead CONFIG_DRM_PANEL
+branch) and selects the MSM_DRM event variant of drm_notifier_callback.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ .../focaltech_touch/focaltech_core.c          |  64 ++++---
+ .../0001-focaltech-msm-drm-notifier.patch     | 178 ++++++++++++++++++
+ s6patch触摸/README.md                       | 100 ++++++++++
+ 3 files changed, 312 insertions(+), 30 deletions(-)
+ create mode 100755 s6patch触摸/0001-focaltech-msm-drm-notifier.patch
+ create mode 100644 s6patch触摸/README.md
+
+diff --git a/drivers/input/touchscreen/focaltech_touch/focaltech_core.c b/drivers/input/touchscreen/focaltech_touch/focaltech_core.c
+index 39e731072..eb019ffdf 100755
+--- a/drivers/input/touchscreen/focaltech_touch/focaltech_core.c
++++ b/drivers/input/touchscreen/focaltech_touch/focaltech_core.c
+@@ -37,15 +37,28 @@
+ #include <linux/of_device.h>
+ #include <linux/of_gpio.h>
+ #include <linux/of_irq.h>
+-#if defined(CONFIG_FB)
++/*
++ * EEBBK S6 (P20H130) fix:
++ * This kernel has CONFIG_FB=y *and* CONFIG_DRM=y, while the display is driven
++ * by MSM DRM (SDE).  The original "#if defined(CONFIG_FB)" therefore registered
++ * the legacy fb_notifier, which an MSM DRM display never fires, so
++ * fts_ts_suspend()/fts_ts_resume() were never called.  With the screen off the
++ * touch controller stayed awake with its IRQ enabled, which produced an
++ * interrupt storm (system extremely laggy after locking) and bogus touch
++ * reports.
++ *
++ * Other drivers in this tree use the MSM DRM client for this display
++ * (hxchipset/himax_common.c: "#ifdef CONFIG_DRM ... msm_drm_register_client"),
++ * and st/fts.c only takes the fb path when CONFIG_FB_MSM (legacy MSM
++ * framebuffer) is set.  Apply the same rule here.
++ */
++#if defined(CONFIG_FB_MSM)
+ #include <linux/notifier.h>
+ #include <linux/fb.h>
+-#elif defined(CONFIG_DRM)
+-#if defined(CONFIG_DRM_PANEL)
+-#include <drm/drm_panel.h>
+-#else
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++/* this display is MSM DRM (SDE): it notifies via the msm_drm chain */
++#include <linux/notifier.h>
+ #include <linux/msm_drm_notify.h>
+-#endif
+ #elif defined(CONFIG_HAS_EARLYSUSPEND)
+ #include <linux/earlysuspend.h>
+ #define FTS_SUSPEND_LEVEL 1     /* Early-suspend level */
+@@ -1494,7 +1507,7 @@ static void fts_resume_work(struct work_struct *work)
+     fts_ts_resume(ts_data->dev);
+ }
+ 
+-#if defined(CONFIG_FB)
++#if defined(CONFIG_FB_MSM)
+ static int fb_notifier_callback(struct notifier_block *self,
+                                 unsigned long event, void *data)
+ {
+@@ -1538,8 +1551,9 @@ static int fb_notifier_callback(struct notifier_block *self,
+ 
+     return 0;
+ }
+-#elif defined(CONFIG_DRM)
+-#if defined(CONFIG_DRM_PANEL)
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++#if 0 /* EEBBK S6: the MSM DRM display never emits DRM_PANEL blank
++         * events - use the MSM_DRM callback of the #else branch */
+ static struct drm_panel *active_panel;
+ 
+ static int drm_check_dt(struct device_node *np)
+@@ -1824,26 +1838,21 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
+     ts_data->pm_suspend = false;
+ #endif
+ 
+-#if defined(CONFIG_FB)
++#if defined(CONFIG_FB_MSM)
+     ts_data->fb_notif.notifier_call = fb_notifier_callback;
+     ret = fb_register_client(&ts_data->fb_notif);
+     if (ret) {
+         FTS_ERROR("[FB]Unable to register fb_notifier: %d", ret);
+     }
+-#elif defined(CONFIG_DRM)
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+     ts_data->fb_notif.notifier_call = drm_notifier_callback;
+-#if defined(CONFIG_DRM_PANEL)
+-    if (active_panel) {
+-        ret = drm_panel_notifier_register(active_panel, &ts_data->fb_notif);
+-        if (ret)
+-            FTS_ERROR("[DRM]drm_panel_notifier_register fail: %d\n", ret);
+-    }
+-#else
++    /* EEBBK S6: register the MSM DRM client (the drm_panel notifier
++     * used before is never notified on this display) */
+     ret = msm_drm_register_client(&ts_data->fb_notif);
+-    if (ret) {
+-        FTS_ERROR("[DRM]Unable to register fb_notifier: %d\n", ret);
+-    }
+-#endif
++    if (ret)
++        FTS_ERROR("[DRM]Unable to register msm_drm notifier: %d\n", ret);
++    else
++        FTS_INFO("[DRM]msm_drm notifier registered for blank/unblank");
+ #elif defined(CONFIG_HAS_EARLYSUSPEND)
+     ts_data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + FTS_SUSPEND_LEVEL;
+     ts_data->early_suspend.suspend = fts_ts_early_suspend;
+@@ -1914,17 +1923,12 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
+     if (ts_data->ts_workqueue)
+         destroy_workqueue(ts_data->ts_workqueue);
+ 
+-#if defined(CONFIG_FB)
++#if defined(CONFIG_FB_MSM)
+     if (fb_unregister_client(&ts_data->fb_notif))
+         FTS_ERROR("[FB]Error occurred while unregistering fb_notifier.");
+-#elif defined(CONFIG_DRM)
+-#if defined(CONFIG_DRM_PANEL)
+-    if (active_panel)
+-        drm_panel_notifier_unregister(active_panel, &ts_data->fb_notif);
+-#else
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+     if (msm_drm_unregister_client(&ts_data->fb_notif))
+-        FTS_ERROR("[DRM]Error occurred while unregistering fb_notifier.\n");
+-#endif
++        FTS_ERROR("[DRM]Error unregistering msm_drm notifier.\n");
+ #elif defined(CONFIG_HAS_EARLYSUSPEND)
+     unregister_early_suspend(&ts_data->early_suspend);
+ #endif
+diff --git a/s6patch触摸/0001-focaltech-msm-drm-notifier.patch b/s6patch触摸/0001-focaltech-msm-drm-notifier.patch
+new file mode 100755
+index 000000000..602104481
+--- /dev/null
++++ b/s6patch触摸/0001-focaltech-msm-drm-notifier.patch
+@@ -0,0 +1,178 @@
++[PATCH 1/1] input: focaltech_touch: register the MSM DRM notifier, not fb_notifier
++
++Symptom (real device): after locking the screen the system becomes extremely
++laggy, and the logs are full of erratic touch reports.
++
++Root cause
++----------
++The driver selects its display-blank notifier with
++
++    #if defined(CONFIG_FB)
++        ... fb_notifier_callback / fb_register_client(&ts_data->fb_notif)
++    #elif defined(CONFIG_DRM)
++        #if defined(CONFIG_DRM_PANEL)
++            ... drm_panel_notifier_register(active_panel, ...)
++        #else
++            ... msm_drm_register_client(&ts_data->fb_notif)
++        #endif
++    #endif
++
++This kernel has CONFIG_FB=y *and* CONFIG_DRM=y, and the display is MSM DRM
++(SDE).  The first branch therefore wins and the driver registers the legacy
++fb_notifier - which an MSM DRM display never fires.  verified in this tree:
++
++    drivers/gpu/drm/msm/msm_atomic.c:266  msm_drm_notifier_call_chain(MSM_DRM_EARLY_EVENT_BLANK, ...)
++    drivers/gpu/drm/msm/msm_atomic.c:287  msm_drm_notifier_call_chain(MSM_DRM_EVENT_BLANK, ...)
++
++so fts_ts_suspend()/fts_ts_resume() - whose only callers are these notifier
++callbacks - were NEVER called.  With the screen off the touch controller was
++left awake with its IRQ enabled:
++
++  * the IRQ keeps firing and every event runs the threaded handler, which does
++    i2c reads -> the CPU is woken continuously (the "very laggy after locking"
++    symptom);
++  * whatever the handler happens to read gets reported as touch points -> the
++    "erratic touch reports" symptom.
++
++The other two mechanism in the driver (the FB/DRM notifier and the early-suspend
++hook) are the only suspend paths; there is no dev_pm_ops on the i2c driver:
++
++    #if defined(CONFIG_PM) && FTS_PATCH_COMERR_PM     /* FTS_PATCH_COMERR_PM == 0 */
++        .pm = &fts_dev_pm_ops,
++    #endif
++
++so nothing else put the controller to sleep either.
++
++Fix
++---
++Discriminate on CONFIG_FB_MSM (the legacy MSM framebuffer), exactly like
++drivers/input/touchscreen/st/fts.c does in this tree, and register the MSM DRM
++client, exactly like drivers/input/touchscreen/hxchipset/himax_common.c does:
++
++    #ifdef CONFIG_DRM
++        ts->fb_notif.notifier_call = drm_notifier_callback;
++        ret = msm_drm_register_client(&ts->fb_notif);
++
++This also fixes the header selection: linux/msm_drm_notify.h was only included
++in the (unreachable) CONFIG_DRM_PANEL #else branch, and the DRM_PANEL variant of
++drm_notifier_callback (which matches DRM_PANEL_* events) is now excluded - the
++MSM_DRM variant matching MSM_DRM_* events is the correct one for
++msm_drm_register_client().
++
++Verified: builds clean (no warnings), and the resulting Image.gz contains the
++new strings ("msm_drm notifier registered for blank/unblank",
++"Unable to register msm_drm notifier") while the fb path strings are gone.
++--- a/drivers/input/touchscreen/focaltech_touch/focaltech_core.c
+++++ b/drivers/input/touchscreen/focaltech_touch/focaltech_core.c
++@@ -37,15 +37,28 @@
++ #include <linux/of_device.h>
++ #include <linux/of_gpio.h>
++ #include <linux/of_irq.h>
++-#if defined(CONFIG_FB)
+++/*
+++ * EEBBK S6 (P20H130) fix:
+++ * This kernel has CONFIG_FB=y *and* CONFIG_DRM=y, while the display is driven
+++ * by MSM DRM (SDE).  The original "#if defined(CONFIG_FB)" therefore registered
+++ * the legacy fb_notifier, which an MSM DRM display never fires, so
+++ * fts_ts_suspend()/fts_ts_resume() were never called.  With the screen off the
+++ * touch controller stayed awake with its IRQ enabled, which produced an
+++ * interrupt storm (system extremely laggy after locking) and bogus touch
+++ * reports.
+++ *
+++ * Other drivers in this tree use the MSM DRM client for this display
+++ * (hxchipset/himax_common.c: "#ifdef CONFIG_DRM ... msm_drm_register_client"),
+++ * and st/fts.c only takes the fb path when CONFIG_FB_MSM (legacy MSM
+++ * framebuffer) is set.  Apply the same rule here.
+++ */
+++#if defined(CONFIG_FB_MSM)
++ #include <linux/notifier.h>
++ #include <linux/fb.h>
++-#elif defined(CONFIG_DRM)
++-#if defined(CONFIG_DRM_PANEL)
++-#include <drm/drm_panel.h>
++-#else
+++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+++/* this display is MSM DRM (SDE): it notifies via the msm_drm chain */
+++#include <linux/notifier.h>
++ #include <linux/msm_drm_notify.h>
++-#endif
++ #elif defined(CONFIG_HAS_EARLYSUSPEND)
++ #include <linux/earlysuspend.h>
++ #define FTS_SUSPEND_LEVEL 1     /* Early-suspend level */
++@@ -1494,7 +1507,7 @@ static void fts_resume_work(struct work_struct *work)
++     fts_ts_resume(ts_data->dev);
++ }
++ 
++-#if defined(CONFIG_FB)
+++#if defined(CONFIG_FB_MSM)
++ static int fb_notifier_callback(struct notifier_block *self,
++                                 unsigned long event, void *data)
++ {
++@@ -1538,8 +1551,9 @@ static int fb_notifier_callback(struct notifier_block *self,
++ 
++     return 0;
++ }
++-#elif defined(CONFIG_DRM)
++-#if defined(CONFIG_DRM_PANEL)
+++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+++#if 0 /* EEBBK S6: the MSM DRM display never emits DRM_PANEL blank
+++         * events - use the MSM_DRM callback of the #else branch */
++ static struct drm_panel *active_panel;
++ 
++ static int drm_check_dt(struct device_node *np)
++@@ -1824,26 +1838,21 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
++     ts_data->pm_suspend = false;
++ #endif
++ 
++-#if defined(CONFIG_FB)
+++#if defined(CONFIG_FB_MSM)
++     ts_data->fb_notif.notifier_call = fb_notifier_callback;
++     ret = fb_register_client(&ts_data->fb_notif);
++     if (ret) {
++         FTS_ERROR("[FB]Unable to register fb_notifier: %d", ret);
++     }
++-#elif defined(CONFIG_DRM)
+++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++     ts_data->fb_notif.notifier_call = drm_notifier_callback;
++-#if defined(CONFIG_DRM_PANEL)
++-    if (active_panel) {
++-        ret = drm_panel_notifier_register(active_panel, &ts_data->fb_notif);
++-        if (ret)
++-            FTS_ERROR("[DRM]drm_panel_notifier_register fail: %d\n", ret);
++-    }
++-#else
+++    /* EEBBK S6: register the MSM DRM client (the drm_panel notifier
+++     * used before is never notified on this display) */
++     ret = msm_drm_register_client(&ts_data->fb_notif);
++-    if (ret) {
++-        FTS_ERROR("[DRM]Unable to register fb_notifier: %d\n", ret);
++-    }
++-#endif
+++    if (ret)
+++        FTS_ERROR("[DRM]Unable to register msm_drm notifier: %d\n", ret);
+++    else
+++        FTS_INFO("[DRM]msm_drm notifier registered for blank/unblank");
++ #elif defined(CONFIG_HAS_EARLYSUSPEND)
++     ts_data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + FTS_SUSPEND_LEVEL;
++     ts_data->early_suspend.suspend = fts_ts_early_suspend;
++@@ -1914,17 +1923,12 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
++     if (ts_data->ts_workqueue)
++         destroy_workqueue(ts_data->ts_workqueue);
++ 
++-#if defined(CONFIG_FB)
+++#if defined(CONFIG_FB_MSM)
++     if (fb_unregister_client(&ts_data->fb_notif))
++         FTS_ERROR("[FB]Error occurred while unregistering fb_notifier.");
++-#elif defined(CONFIG_DRM)
++-#if defined(CONFIG_DRM_PANEL)
++-    if (active_panel)
++-        drm_panel_notifier_unregister(active_panel, &ts_data->fb_notif);
++-#else
+++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++     if (msm_drm_unregister_client(&ts_data->fb_notif))
++-        FTS_ERROR("[DRM]Error occurred while unregistering fb_notifier.\n");
++-#endif
+++        FTS_ERROR("[DRM]Error unregistering msm_drm notifier.\n");
++ #elif defined(CONFIG_HAS_EARLYSUSPEND)
++     unregister_early_suspend(&ts_data->early_suspend);
++ #endif
+diff --git a/s6patch触摸/README.md b/s6patch触摸/README.md
+new file mode 100644
+index 000000000..d98bac2d0
+--- /dev/null
++++ b/s6patch触摸/README.md
+@@ -0,0 +1,100 @@
++# s6patch触摸 — EEBBK S6 (P20H130 / sm6150) 锁屏后卡顿 + 触摸乱上报
++
++状态：**已定位并修复**（离线验证通过：编译零警告、镜像内符号正确；真机待刷入确认）
++
++## 症状
++
++锁屏后系统非常卡，日志里发现触摸事件乱上报。
++
++## 根因
++
++`drivers/input/touchscreen/focaltech_touch/focaltech_core.c` 用下面的 `#if/#elif`
++链选择「熄屏通知器」：
++
++```c
++#if defined(CONFIG_FB)
++    ts_data->fb_notif.notifier_call = fb_notifier_callback;
++    ret = fb_register_client(&ts_data->fb_notif);            /* ← 实际走了这条 */
++#elif defined(CONFIG_DRM)
++    ts_data->fb_notif.notifier_call = drm_notifier_callback;
++#if defined(CONFIG_DRM_PANEL)
++    ... drm_panel_notifier_register(active_panel, ...)
++#else
++    ... msm_drm_register_client(&ts_data->fb_notif)
++#endif
++#endif
++```
++
++本内核 **`CONFIG_FB=y` 与 `CONFIG_DRM=y` 同时开启**，而屏幕由 **MSM DRM（SDE）** 驱动，
++所以第一个分支胜出，注册的是**旧的 fb_notifier** —— MSM DRM 显示**永远不会触发** FB blank 事件。
++本树里的证据：
++
++```
++drivers/gpu/drm/msm/msm_atomic.c:266  msm_drm_notifier_call_chain(MSM_DRM_EARLY_EVENT_BLANK, ...)
++drivers/gpu/drm/msm/msm_atomic.c:287  msm_drm_notifier_call_chain(MSM_DRM_EVENT_BLANK, ...)
++```
++
++于是 `fts_ts_suspend()` / `fts_ts_resume()` —— 它们的调用点**只**存在于这些通知回调里 ——
++**从未被调用**。而 i2c 驱动上也没有 dev_pm_ops（`FTS_PATCH_COMERR_PM == 0`）：
++
++```c
++#if defined(CONFIG_PM) && FTS_PATCH_COMERR_PM
++        .pm = &fts_dev_pm_ops,
++#endif
++```
++
++所以熄屏后触摸控制器**一直醒着、IRQ 一直开着**：
++
++* IRQ 持续触发，每个事件都跑线程化中断处理并做 i2c 读 → CPU 被反复唤醒 → **锁屏后很卡**；
++* 读回来的数据被当成触摸点上报 → **触摸乱上报**。
++
++> 补充：本驱动的来源也值得注意 —— `README.txt` 写着「取自 Firefly RK3399 公开源码…
++> **本驱动在 EEBBK S5 测试可用** By XiKoTaSu」，即从 S5 移植的第三方版本，
++> 与信号链的显示框架匹配问题正是这类移植最容易踩的坑。
++
++## 修复
++
++按**本树自己的既有约定**判别与注册：
++
++* `st/fts.c` 只在 `CONFIG_FB_MSM`（旧 MSM framebuffer）时才走 fb 路径；
++* `hxchipset/himax_common.c` 用 `#ifdef CONFIG_DRM` + `msm_drm_register_client()`。
++
++所以把判别条件从 `CONFIG_FB` 改成 `CONFIG_FB_MSM`，并注册 msm_drm 客户端：
++
++```c
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++    ts_data->fb_notif.notifier_call = drm_notifier_callback;
++    ret = msm_drm_register_client(&ts_data->fb_notif);
++    if (ret)
++        FTS_ERROR("[DRM]Unable to register msm_drm notifier: %d\n", ret);
++    else
++        FTS_INFO("[DRM]msm_drm notifier registered for blank/unblank");
++```
++
++顺带修掉同源问题：`<linux/msm_drm_notify.h>` 原先只被包含在**不可达**的
++`CONFIG_DRM_PANEL` 的 `#else` 分支里；同时把只匹配 `DRM_PANEL_*` 事件的那个
++`drm_notifier_callback` 变体排除，改用匹配 `MSM_DRM_*` 事件的变体
++（与 `msm_drm_register_client()` 配对）。
++
++## 验证
++
++```
++编译：focaltech_core.o 重新编译，0 warning / 0 error
++镜像（Image.gz）内：
++  msm_drm notifier registered for blank/unblank   1
++  Unable to register msm_drm notifier             1
++  msm_drm_register_client / msm_drm_unregister_client   1 / 1
++  Unable to register fb_notifier                  0    ← 旧 fb 路径已不再编译
++  adsp-loader 2 · driver/BackCamera_info 1             ← 音频/相机修复未受影响
++打包：kernel == Image.gz / ramdisk == factory / dtb == factory → ALL CHECKS PASSED
++```
++
++刷入后锁屏应观察到：`logcat -s FTS_TS` 出现 `[DRM]msm_drm notifier registered for blank/unblank`
++与 `DRM event:…,blank:…`，并且熄屏后不再有触摸上报。
++
++## 应用
++
++```bash
++cd android_kernel_eebbk_sm6150
++git apply s6patch触摸/0001-focaltech-msm-drm-notifier.patch
++```
