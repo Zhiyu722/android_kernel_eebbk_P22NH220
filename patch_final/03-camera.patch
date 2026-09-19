@@ -1,0 +1,156 @@
+diff --git a/drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_soc.c b/drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_soc.c
+index bd087b7ec..b09c3aa7a 100644
+--- a/drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_soc.c
++++ b/drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_soc.c
+@@ -119,6 +119,56 @@ int cam_eeprom_spi_parse_of(struct cam_sensor_spi_client *spi_dev)
+  * the @of node, calculate total data length, and allocates required buffer.
+  * It only fills the map, but does not perform actual reading.
+  */
++/*
++ * EEBBK S6 (P20H130): the factory device tree names every memory map property
++ * with the qcom, prefix - qcom,num-blocks, qcom,page0, qcom,poll0, qcom,mem0
++ * and so on - while this driver looks them up unprefixed.  The whole map then
++ * failed to parse ("num-blocks not available rc -22"), so no eeprom subdevice
++ * was created for either camera and the front camera never reached the camera
++ * provider.  Try the prefixed name first and fall back to the bare one, which
++ * keeps an upstream device tree working too.
++ */
++static int cam_eeprom_read_u32_prop(struct device_node *node, const char *name,
++				    uint32_t *value)
++{
++	char property[PROPERTY_MAXSIZE];
++
++	snprintf(property, PROPERTY_MAXSIZE, "qcom,%s", name);
++	if (!of_property_read_u32(node, property, value))
++		return 0;
++	return of_property_read_u32(node, name, value);
++}
++
++static int cam_eeprom_read_u32_array_prop(struct device_node *node,
++					  const char *name, uint32_t *value,
++					  uint32_t count)
++{
++	char property[PROPERTY_MAXSIZE];
++	int  n;
++
++	snprintf(property, PROPERTY_MAXSIZE, "qcom,%s", name);
++	n = of_property_count_elems_of_size(node, property, sizeof(uint32_t));
++	if (n <= 0) {
++		snprintf(property, PROPERTY_MAXSIZE, "%s", name);
++		n = of_property_count_elems_of_size(node, property,
++						    sizeof(uint32_t));
++	}
++	if (n <= 0)
++		return -EINVAL;
++	if (n > (int)count)
++		n = count;
++
++	/*
++	 * EEBBK S6 (P20H130): the factory device tree gives six values per
++	 * memory map property while MSM_EEPROM_MEM_MAP_PROPERTIES_CNT is eight,
++	 * so asking for eight failed with -EINVAL ("failed: page not available
++	 * rc -22") and the map was torn down.  Read what the tree actually
++	 * provides; the remaining fields stay zero, which is what vzalloc()
++	 * already produces and what the unused entries should be.
++	 */
++	return of_property_read_u32_array(node, property, value, n);
++}
++
+ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
+ 	struct cam_eeprom_memory_block_t *data)
+ {
+@@ -128,7 +178,7 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
+ 	struct    cam_eeprom_memory_map_t *map;
+ 
+ 	snprintf(property, PROPERTY_MAXSIZE, "num-blocks");
+-	rc = of_property_read_u32(node, property, &data->num_map);
++	rc = cam_eeprom_read_u32_prop(node, property, &data->num_map);
+ 	if (rc < 0) {
+ 		CAM_ERR(CAM_EEPROM, "failed: num-blocks not available rc %d",
+ 			rc);
+@@ -144,7 +194,7 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
+ 
+ 	for (i = 0; i < data->num_map; i++) {
+ 		snprintf(property, PROPERTY_MAXSIZE, "page%d", i);
+-		rc = of_property_read_u32_array(node, property,
++		rc = cam_eeprom_read_u32_array_prop(node, property,
+ 			(uint32_t *) &map[i].page, count);
+ 		if (rc < 0) {
+ 			CAM_ERR(CAM_EEPROM, "failed: page not available rc %d",
+@@ -153,19 +203,19 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
+ 		}
+ 
+ 		snprintf(property, PROPERTY_MAXSIZE, "pageen%d", i);
+-		rc = of_property_read_u32_array(node, property,
++		rc = cam_eeprom_read_u32_array_prop(node, property,
+ 			(uint32_t *) &map[i].pageen, count);
+ 		if (rc < 0)
+ 			CAM_DBG(CAM_EEPROM, "pageen not needed");
+ 
+ 		snprintf(property, PROPERTY_MAXSIZE, "saddr%d", i);
+-		rc = of_property_read_u32_array(node, property,
++		rc = cam_eeprom_read_u32_array_prop(node, property,
+ 			(uint32_t *) &map[i].saddr, 1);
+ 		if (rc < 0)
+ 			CAM_DBG(CAM_EEPROM, "saddr not needed - block %d", i);
+ 
+ 		snprintf(property, PROPERTY_MAXSIZE, "poll%d", i);
+-		rc = of_property_read_u32_array(node, property,
++		rc = cam_eeprom_read_u32_array_prop(node, property,
+ 			(uint32_t *) &map[i].poll, count);
+ 		if (rc < 0) {
+ 			CAM_ERR(CAM_EEPROM, "failed: poll not available rc %d",
+@@ -174,7 +224,7 @@ int cam_eeprom_parse_dt_memory_map(struct device_node *node,
+ 		}
+ 
+ 		snprintf(property, PROPERTY_MAXSIZE, "mem%d", i);
+-		rc = of_property_read_u32_array(node, property,
++		rc = cam_eeprom_read_u32_array_prop(node, property,
+ 			(uint32_t *) &map[i].mem, count);
+ 		if (rc < 0) {
+ 			CAM_ERR(CAM_EEPROM, "failed: mem not available rc %d",
+diff --git a/drivers/media/platform/msm/camera/cam_sensor_module/cam_sensor/cam_sensor_core.c b/drivers/media/platform/msm/camera/cam_sensor_module/cam_sensor/cam_sensor_core.c
+index 7d048b982..cb04da983 100644
+--- a/drivers/media/platform/msm/camera/cam_sensor_module/cam_sensor/cam_sensor_core.c
++++ b/drivers/media/platform/msm/camera/cam_sensor_module/cam_sensor/cam_sensor_core.c
+@@ -639,9 +639,29 @@ int cam_sensor_match_id(struct cam_sensor_ctrl_t *s_ctrl)
+ 	CAM_DBG(CAM_SENSOR, "read id: 0x%x expected id 0x%x:",
+ 			 chipid, slave_info->sensor_id);
+ 	if (cam_sensor_id_by_mask(s_ctrl, chipid) != slave_info->sensor_id) {
+-		CAM_ERR(CAM_SENSOR, "chip id %x does not match %x",
+-				chipid, slave_info->sensor_id);
+-		return -ENODEV;
++		/*
++		 * EEBBK S6 (P20H130): the userspace declares a single byte id for
++		 * the front camera (ov16a10: sensor_id 0x56) while its id register
++		 * reads back 0x5616 over the word sized read this driver performs.
++		 * The factory driver passes the address and data types that
++		 * userspace specifies (addr_type/data_type of the sensor board
++		 * info), so the same register yields 0x56 there and the probe
++		 * succeeds; with the hardcoded word read the comparison failed and
++		 * the front camera never finished probing, which is why only the
++		 * rear camera reached the camera provider.
++		 *
++		 * Accept the leading byte of the read value as well: for the front
++		 * sensor 0x5616 >> 8 is 0x56, which is exactly what was declared.
++		 */
++		if ((chipid >> 8) != slave_info->sensor_id &&
++		    (chipid & 0xff) != slave_info->sensor_id) {
++			CAM_ERR(CAM_SENSOR, "chip id %x does not match %x",
++					chipid, slave_info->sensor_id);
++			return -ENODEV;
++		}
++		CAM_INFO(CAM_SENSOR,
++			 "chip id %x matched by its leading byte, expected %x",
++			 chipid, slave_info->sensor_id);
+ 	}
+ 	return rc;
+ }
+# 03-camera
+#
+# 相机：cam_eeprom 按原厂方式读内存映射并恢复 /proc/driver/*Camera_info；cam_sensor 接受 1 字节 id
+#
+# 由 git diff 525066d92..HEAD -- <下列路径> 生成：
+#   drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_soc.c
+#   drivers/media/platform/msm/camera/cam_sensor_module/cam_sensor/cam_sensor_core.c
+

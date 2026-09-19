@@ -1,0 +1,157 @@
+From 804924c0e9c72a299d00d32216f866feab1d2382 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 13:56:38 +0800
+Subject: [PATCH 61/67] docs: document the ReSukiSU integration
+
+Adds section 12 to EEBBK_S6_changes.md: hook table with the exact insert
+points and the enforced symbols, why SUSFS and the static symbol exports are
+not needed, the three vendored-mode adaptations, the build/config commands,
+the compile-time self-check output, the device verification results and the
+rollback path.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ EEBBK_S6_changes.md | 133 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 133 insertions(+)
+
+diff --git a/EEBBK_S6_changes.md b/EEBBK_S6_changes.md
+index efaa1bfc7..e392c7767 100755
+--- a/EEBBK_S6_changes.md
++++ b/EEBBK_S6_changes.md
+@@ -801,3 +801,136 @@ DRDY（bit0）置位，采样有效。
+   有了这次修复（真卡住能被识别），将来可以直接在这基础上加“下降不足自动补时间”。
+ * 本节的改动已合入并推送，`patch+++/optional-hall-enable-start-bit.patch` 已删除
+   （内容变成正式提交）。
++
++## 十二、集成 ReSukiSU（KernelSU 的非 GKI 分支）：内核级 root（2026-09-19）
++
++### 1. 结论
++
++* 本内核现在自带 ReSukiSU（KernelSU 的社区分支，支持 3.4+ 非 GKI 内核）：
++  `CONFIG_KSU=y` + `CONFIG_KSU_MANUAL_HOOK=y`，跟着 `h130_debug.config` / `h130_release.config` 一起编译进 `Image.gz`，
++  不是 LKM、不需要额外刷 `init_boot`。
++* 4.14 没有 GKI2 的 syscall tracepoint，官方唯一可行方案是"手动钩子"，本仓库只改了 **4 个内核文件**
++  （`fs/stat.c`、`fs/exec.c`、`fs/open.c`、`kernel/reboot.c`）。
++* 另外三处钩子（setresuid / init.rc read / 输入设备）由 ReSukiSU 自带的 LSM 与 input handler 提供，
++  对应 `CONFIG_KSU_MANUAL_HOOK_AUTO_{SETUID,INITRC,INPUT}_HOOK`（默认 y），**源码不用动**。
++* ReSukiSU 在编译期会逐个 `grep` 钩子，缺一个就直接 `$(error)` 终止编译，所以"能不能编过"本身就是钩子齐全的证明。
++* 内核上报版本号 **35144**（= ReSukiSU v4.2.0-rc2 的 versionCode），
++  官方 Manager 要求内核 ≥ `Natives.MINIMAL_SUPPORTED_KERNEL = 35002`，且 `uapi/` 与 v4.2.0-rc2 **逐字节相同**，
++  因此配套 Manager 用 **v4.2.0-rc2**（`dist/ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk`）。
++
++### 2. 手动钩子落点（官方文档 3.14+ / 4.19- 两个分支的写法，已按本树 4.14 实际代码调整）
++
++| 文件 | 函数 | 插入的调用 | 编译期校验符号 |
++|---|---|---|---|
++| `fs/exec.c` | `do_execveat_common()` 声明之后、`IS_ERR(filename)` 之前 | `ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);` | `ksu_handle_execveat` |
++| `fs/exec.c` | `out_ret:` 之后、`putname(filename)` 之前 | `ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);` | （无强制校验） |
++| `fs/stat.c` | `newfstatat` / `fstatat64` / `compat newfstatat` | `ksu_handle_stat(&dfd, &filename, &flag);` | `ksu_handle_stat` |
++| `fs/stat.c` | `newfstat` / `fstat64` 的 `return error;` 之前 | `ksu_handle_newfstat_ret(&fd, &statbuf);` / `ksu_handle_fstat64_ret(&fd, &statbuf);` | `ksu_handle_newfstat_ret`、`ksu_handle_fstat64_ret` |
++| `fs/open.c` | `faccessat()` 内（4.19- 的写法：函数体直接写在 syscall 里） | `ksu_handle_faccessat(&dfd, &filename, &mode, NULL);` | `ksu_handle_faccessat` |
++| `kernel/reboot.c` | `SYSCALL_DEFINE4(reboot, ...)` 内 | `ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);` | `ksu_handle_sys_reboot` |
++| （无需改码） | setresuid / init.rc / input | `CONFIG_KSU_MANUAL_HOOK_AUTO_*_HOOK=y`（LSM） | 由 Kconfig 提供 |
++
++注意两点与官方文档的差异：
++
++1. 官方 3.14+ 的 diff 是针对 4.19+ 的 `do_execveat_common()` → `__do_execve_file()` 结构（把整个函数包一层）；
++   本树 4.14 的 `do_execveat_common()` 自己就是完整实现，所以入口钩子放函数开头、出口钩子放唯一的 `out_ret:`。
++   `ksu_handle_execve`（`const char *` 版本）是 **3.14 及更早**才允许的写法，4.14 用它会直接被 `manual_hook_check.mk` 判错。
++2. `fs/open.c` 的 4.19- 分支只钩 `faccessat`，本树 `SYSCALL_DEFINE2(access)` 走的是另一条路径，不钩也不会少功能。
++
++### 3. 没有做的两件事（以及原因）
++
++* **SUSFS**：保持 `# CONFIG_KSU_SUSFS is not set`。SUSFS 官方只支持 5.10+ GKI，而且它会把
++  `ksu_handle_stat()` / `ksu_handle_faccessat()` 的原型换成 `struct filename **` 版本，与上面的钩子写法冲突。
++* **"Static symbol export" 那 8 处去 `static`**（`write_op` / `sel_handle_status_ops` / `policy_rwlock` /
++  `sel_mutex` / `selinux_ops` / `security_dump_masked_av` / `context_struct_compute_av` / `selinux_status_page`）：
++  官方文档写明"打开 `CONFIG_KALLSYMS_ALL` 就可以不做这些改动"，本树两个 config 本来就 `CONFIG_KALLSYMS_ALL=y`，
++  编译期也因此跳过了这些检查（`KernelSU/kernel/tools/static_export_check.mk`）。
++
++### 4. 把 KernelSU 当"内置源码"而不是 submodule：3 处适配（都在 `KernelSU/kernel/Kbuild`）
++
++| # | 问题 | 处理 |
++|---|---|---|
++| 1 | 官方 `KernelSU/setup.sh` 用 `git clone` 把 KernelSU 做成 submodule；Kbuild 里 `test -e $(KSU_SRC)/../.git` 不成立就 `$(error)` | 本仓库把 KernelSU 源码**直接内置在仓库里**（submodule 在 tar/zip 交付中会丢，而且 git 不允许跟踪任何含 `.git` 的路径），改成打印一行提示 |
++| 2 | 版本号原本由 git 算：`30000 + commit 数 + 700` | 内置后没有 git 元数据，固定为 `KSU_LOCAL_VERSION := 4444` → `KSU_VERSION = 35144`，`KSU_VERSION_FULL = v4.2.0-rc2-vendored@ReSukiSU` |
++| 3 | `compat/kernel_compat.h` → `ss/policydb.h` → `ss/sidtab.h` → `"flask.h"`，而 `flask.h`/`av_permissions.h` 是 `security/selinux/Makefile` **生成到 obj 树**的；官方 in-tree 编译（obj == src）才能直接找到 | 补 `ccflags-y += -I$(objtree)/security/selinux`，并在 `build_eebbk_clang11.sh` 里先构建 `security/selinux/ init/`（`compile.h` 同理），顺带消掉 `-j` 并行时 `security/` 与 `drivers/` 的竞争 |
++
++### 5. 配置与构建
++
++```diff
++# arch/arm64/configs/h130_debug.config 与 h130_release.config 末尾
+++CONFIG_KSU=y
+++CONFIG_KSU_MANUAL_HOOK=y
+++# CONFIG_KSU_TRACEPOINT_HOOK is not set
+++CONFIG_KSU_DEBUG=y            # 仅调试版；正式版可去掉
+++CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+++# CONFIG_KSU_DISABLE_MANAGER is not set
++```
++
++```sh
++# 调试版（h130_debug.config：CONFIG_BBK_DEBUG_BRINGUP=y + KSU_DEBUG=y）
++OUT=out_ksu CONFIG=h130_debug.config TECHPACK_MODE=y ./build_eebbk_clang11.sh
++# 打包（内核 + 原厂 ramdisk + wlan.ko）
++python3 tools/mkboot3.py out_ksu/arch/arm64/boot/Image.gz boot_ksu_debug.img /root/wlan.ko
++```
++
++编译日志里的自检（`KernelSU/kernel/tools/manual_hook_check.mk`）：
++
++```
++-- ReSukiSU version code: 35144
++-- ReSukiSU version name: v4.2.0-rc2-vendored@ReSukiSU
++-- Supported Unofficial Manager: MKSU, RKSU, KOWSU, SukiSU-Ultra, ReSukiSU
++-- KERNEL_VERSION: 4.14
++-- KERNEL_TYPE: Non-GKI
++-- ReSukiSU: using Manual Hook
++-- ReSukiSU/manual_hook: You are using LSM hooks for setuid hooks.
++-- ReSukiSU/manual_hook: You are using LSM hooks for init rc hooks.
++-- ReSukiSU/manual_hook: ksu_handle_execveat found
++-- ReSukiSU/manual_hook: ksu_handle_faccessat found
++-- ReSukiSU/manual_hook: ksu_handle_stat found
++-- ReSukiSU/manual_hook: ksu_handle_newfstat_ret found
++-- ReSukiSU/manual_hook: ksu_handle_fstat64_ret found
++-- ReSukiSU/manual_hook: ksu_handle_sys_reboot found
++```
++
++若 `grep` 找不到某个符号，这里会直接变成 `$(error You should integrate ReSukiSU in your kernel.)` 并中断编译。
++
++### 6. 实机验证（2026-09-19，调试版镜像）
++
++镜像：`dist/boot_ksu_debug.img`（18776444 字节，md5 `4e99cd80950d99c0afaa45401d884c66`），
++由 `out_ksu`（`h130_debug.config`）的 `Image.gz` 打包，ramdisk 内仍带 `wlan.ko`。
++
++| 检查 | 结果 |
++|---|---|
++| 开机 | `sys.boot_completed=1` ✓ |
++| KernelSU 初始化 | `KernelSU: Initialized with driver version: 35144, full_version: v4.2.0-rc2-vendored@ReSukiSU, ABI: aarch64, Work mode: Built-in` ✓ |
++| 调试模式标志 | `KernelSU: shell is allowed at init!`（`CONFIG_KSU_DEBUG=y` 才会出现；调试版 adb shell 天然有 root，正式版不会） |
++| 功能注册 | `feature: registered handler for sulog / adb_root / selinux_hide` ✓ |
++| kallsyms | `grep -c ksu_handle /proc/kallsyms` = 30，六个强制钩子符号齐全 ✓ |
++| WiFi | `lsmod` 里 `wlan 3731456` 已加载 ✓ |
++| 霍尔 / 升降 | `id=0x9c`、`up:1 down:-722`；升降一次 2526 ms、`finish_move ... standby` ✓ |
++| 前序修复未回退 | 音频栈字符串仍在 `Image.gz`（adsp-loader/q6afe/bolero/wcd937x/aw882xx）✓ |
++
++App 侧（用户自装）验证：装上 `ReSukiSU_v4.2.0-rc2_35144-*.apk` 后应显示"工作中/已安装"，
++调试版还可以直接 `adb shell su -c id` 看到 `uid=0(root)`。
++
++### 7. 刷机与 App
++
++```sh
++adb reboot fastboot                 # 走 fastbootd（is-userspace: yes）
++fastboot flash boot boot_ksu_debug.img
++fastboot reboot
++```
++
++App 需要用户自己装（官方 release，与内核版本号对齐）：
++
++* `dist/ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk`
++  （md5 `389006099b815dd588fbcd354a05fc2b`，来源
++  `https://github.com/ReSukiSU/ReSukiSU/releases/download/v4.2.0-rc2/`）
++* 装完打开 App：显示"工作中 / 已安装"即内核已被识别；之后授权 App 即可拿 root。
++
++### 8. 回滚 / 关掉 root
++
++* 刷回不含 KSU 的镜像即可：`dist/boot_final_release.img`（正式版，无 KSU）；
++* 或者把 config 里的 `CONFIG_KSU` 改成 `# CONFIG_KSU is not set` 重编（注意 KSU 关闭后
++  `KernelSU/kernel/Kbuild` 里的钩子检查不会执行，源码里的 4 处钩子留在那里也无副作用）；
++* KSU 只在内核里增加钩子，没有改 `avb`/`verity`/`vbmeta`，所以刷回原镜像就是完全恢复。

@@ -1,0 +1,34 @@
+From 6e67f03cbbc1bdc2339bdfeeae018ff25bf428d4 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 21:10:18 +0800
+Subject: [PATCH 09/67] kbuild: Track an empty .scmversion so the release stays
+ 4.14.190-perf
+
+This tree is a git repository, so scripts/setlocalversion appends "+" and the
+kernel release becomes 4.14.190-perf+, which no longer matches the vendor DLKM
+vermagic ("4.14.190-perf SMP preempt mod_unload modversions aarch64"): every
+module in /vendor/lib/modules is then rejected.  An empty .scmversion keeps the
+release exact.  The top-level .gitignore ignores dotfiles, so un-ignore it and
+add it explicitly.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ .gitignore  | 3 +++
+ .scmversion | 0
+ 2 files changed, 3 insertions(+)
+ create mode 100644 .scmversion
+
+diff --git a/.gitignore b/.gitignore
+index 2eb11afdf..dfc28cf9a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -132,3 +132,6 @@ kernel/configs/android-*.cfg
+ Android.bp
+ out/
+ out_*/
++
++# keep the kernel release pinned to 4.14.190-perf
++!.scmversion
+diff --git a/.scmversion b/.scmversion
+new file mode 100644
+index 000000000..e69de29bb

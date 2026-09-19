@@ -1,0 +1,52 @@
+From 8877f31d63aa12b0bfc19b19daf4d1f091050748 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 19:29:04 +0800
+Subject: [PATCH 52/67] input: misc: mxm1120: Leave the hall sensors in standby
+ for now
+
+Starting the conversion (bit 0, START) is what the factory driver does and it
+makes the samples real - bbk_hall_data goes from the constant 256 to up:1
+down:-700.  But on this ROM those samples reach BBK's camera service, which then
+drives the elevator through its closed loop path (the factory's
+vib_pwm_state_init / vib_pwm_state_move_sate pair) instead of the time based
+move.  That mover is not implemented in this kernel, and the elevator stops half
+way and will not rise again - the front camera becomes unusable.
+
+Keep the sensors in standby until the closed loop path is ported: with no valid
+samples (the -2000 failure value) the service uses the move that works, and the
+chip id, the sample decoding and the register map all stay fixed underneath.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ drivers/input/misc/mxm1120.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/input/misc/mxm1120.c b/drivers/input/misc/mxm1120.c
+index 7a5c43bb3..db0ab5238 100644
+--- a/drivers/input/misc/mxm1120.c
++++ b/drivers/input/misc/mxm1120.c
+@@ -233,12 +233,19 @@ static int m1120_set_operation_mode(struct m1120_data *d, bool measure)
+ 		return ret;
+ 
+ 	/*
+-	 * [RE] Start and stop the conversion through START (bit 0), the way the
+-	 * factory does.  Toggling bit 6 instead - as this driver did - leaves
+-	 * the chip in standby: register 0x10 stays zero, the status byte never
+-	 * reports DRDY and every sample decodes to nothing.
++	 * [RE] Bit 0 is START and starting the conversion is what the factory
++	 * driver does, but on this ROM the hall samples then reach BBK's camera
++	 * service, which switches the elevator from its open loop timing to a
++	 * closed loop path that this kernel does not implement (the factory's
++	 * vib_pwm_state_move_sate / vib_pwm_state_init pair).  The elevator then
++	 * stops half way - "卡一半不升" - and the front camera is unusable.
++	 *
++	 * Until that path is ported, keep the sensors in standby as before: with
++	 * no valid samples (bbk_hall_data reports the -2000 failure value) the
++	 * service uses the time based move that works, and the camera raises
++	 * normally.  Set M1120_OP_START_SET below to restore the conversion.
+ 	 */
+-	v = measure ? (v | M1120_OP_START_SET) : (v & ~M1120_OP_START);
++	v = measure ? (v | M1120_OP_MEASUREMENT) : (v & ~M1120_OP_MEASUREMENT);
+ 	ret = m1120_i2c_set_reg(d, M1120_REG_OPMODE, v);
+ 	dev_info(d->dev, "%s: %s, opmode 0x%02x\n", __func__,
+ 		 measure ? "start conversion" : "stop conversion", v);

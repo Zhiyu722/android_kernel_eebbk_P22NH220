@@ -1,0 +1,137 @@
+From bb75bef6933bce7a053d424f397370732af028aa Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:10:21 +0800
+Subject: [PATCH 27/67] input: hall: Make the bring-up build usable for
+ diagnosis
+
+Flashing the previous bring-up image showed two problems with it:
+
+ - SELinux still reported Enforcing.  Forcing permissive in selinux_init() is
+   not enough: Android init writes 1 to /sys/fs/selinux/enforce early, and the
+   node is root only, so the kernel cannot be flipped back from adb shell and
+   neither /proc/eebbk_kmsg nor the vendor sysfs nodes can be read.  Ignore
+   writes to that node when CONFIG_BBK_DEBUG_BRINGUP is set, so the bring-up
+   image really does stay permissive.
+
+ - the hall sensors still do not bind, and without the kernel log there is
+   nothing to go on.  Under the same symbol, let an unreadable register or an
+   adapter that does not advertise SMBUS_I2C_BLOCK only warn instead of
+   failing the probe, so one flash both produces the log and gives the driver
+   a chance to bind and report what the sensor actually answers.
+
+The strict, vendor-like checks remain compiled in for every other build: the
+relaxations live in #ifdef CONFIG_BBK_DEBUG_BRINGUP branches.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ drivers/input/misc/ist8801.c | 13 +++++++++++++
+ drivers/input/misc/mxm1120.c | 23 +++++++++++++++++++++++
+ security/selinux/selinuxfs.c | 14 ++++++++++++++
+ 3 files changed, 50 insertions(+)
+
+diff --git a/drivers/input/misc/ist8801.c b/drivers/input/misc/ist8801.c
+index 4dfca965d..c75a1b523 100755
+--- a/drivers/input/misc/ist8801.c
++++ b/drivers/input/misc/ist8801.c
+@@ -345,6 +345,18 @@ static int ist8801_i2c_probe(struct i2c_client *client,
+ 
+ 	ist8801_parse_dt(d);
+ 
++#ifdef CONFIG_BBK_DEBUG_BRINGUP
++	/* bring-up: a single unreadable register must not stop the probe */
++	ret = ist8801_reset_device(d);
++	if (ret)
++		dev_err(d->dev, "%s : ist8801_reset_device fail(%d), continuing anyway\n",
++			__func__, ret);
++
++	ret = ist8801_get_id(d, &did);
++	if (ret)
++		dev_err(d->dev, "%s : read IST8801_REG_DID failed(%d), continuing anyway\n",
++			__func__, ret);
++#else
+ 	ret = ist8801_reset_device(d);
+ 	if (ret) {
+ 		dev_err(d->dev, "%s : ist8801_reset_device fail\n", __func__);
+@@ -357,6 +369,7 @@ static int ist8801_i2c_probe(struct i2c_client *client,
+ 			__func__, ret);
+ 		return ret;
+ 	}
++#endif
+ 	d->did = did;
+ 
+ 	dev_info(d->dev, "%s: ist8801 at 0x%02x, device id 0x%02x\n",
+diff --git a/drivers/input/misc/mxm1120.c b/drivers/input/misc/mxm1120.c
+index f4373f784..f2d5984b5 100644
+--- a/drivers/input/misc/mxm1120.c
++++ b/drivers/input/misc/mxm1120.c
+@@ -168,6 +168,21 @@ static int m1120_init_device(struct m1120_data *d)
+ 	int ret;
+ 
+ 	/* [RE] the exact sequence the vendor probe used */
++#ifdef CONFIG_BBK_DEBUG_BRINGUP
++	/* bring-up: a single unreadable register must not stop the probe */
++	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL2, 0x01);
++	if (ret)
++		dev_err(d->dev, "%s: write 0x07 failed (%d), continuing anyway\n",
++			__func__, ret);
++
++	ret = m1120_get_id(d, &d->device_id);
++	if (ret)
++		dev_err(d->dev, "%s: read id failed (%d), continuing anyway\n",
++			__func__, ret);
++	else if (d->device_id != M1120_ID_EXPECT)
++		dev_err(d->dev, "%s: current device id(0x%02X) is not M1120 device id(0x%02X)\n",
++			__func__, d->device_id, M1120_ID_EXPECT);
++#else
+ 	ret = m1120_i2c_set_reg(d, M1120_REG_CTRL2, 0x01);
+ 	if (ret)
+ 		return ret;
+@@ -180,6 +195,7 @@ static int m1120_init_device(struct m1120_data *d)
+ 			__func__, d->device_id, M1120_ID_EXPECT);
+ 		return -ENODEV;
+ 	}
++#endif
+ 
+ 	ret = m1120_i2c_set_reg(d, M1120_REG_ID, 0x40);
+ 	if (ret)
+@@ -535,8 +551,15 @@ static int m1120_i2c_drv_probe(struct i2c_client *client,
+ 
+ 	if (!i2c_check_functionality(client->adapter,
+ 				     I2C_FUNC_SMBUS_I2C_BLOCK | I2C_FUNC_I2C)) {
++#ifdef CONFIG_BBK_DEBUG_BRINGUP
++		/* bring-up: warn instead of refusing to probe */
++		dev_err(d->dev,
++			"%s: adapter does not advertise SMBUS_I2C_BLOCK, continuing anyway\n",
++			__func__);
++#else
+ 		dev_err(d->dev, "%s: i2c_check_functionality was failed\n", __func__);
+ 		return -EOPNOTSUPP;
++#endif
+ 	}
+ 
+ 	/* optional supplies: the vendor probe requested two regulators */
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index dba17ea51..d5b2df738 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -159,6 +159,20 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+ 
+ 	new_value = !!new_value;
+ 
++#ifdef CONFIG_BBK_DEBUG_BRINGUP
++	/*
++	 * EEBBK bring-up: Android init writes 1 here early in userspace, which
++	 * overrode the permissive start in selinux_init().  Ignore the request
++	 * so the kernel stays permissive and adb shell can read the vendor sysfs
++	 * nodes and /proc/eebbk_kmsg.
++	 */
++	pr_info("SELinux:  EEBBK bring-up build ignores enforce write (%d)\n",
++		new_value);
++	length = count;
++	kfree(page);
++	return length;
++#endif
++
+ 	old_value = enforcing_enabled(state);
+ 	if (new_value != old_value) {
+ 		length = avc_has_perm(&selinux_state,

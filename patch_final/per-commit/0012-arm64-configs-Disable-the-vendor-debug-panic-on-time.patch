@@ -1,0 +1,81 @@
+From adf179dadcd030248a10fee029b8e22fd94f4da3 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 21:50:03 +0800
+Subject: [PATCH 12/67] arm64: configs: Disable the vendor debug
+ panic-on-timeout switches
+
+The factory config leaves several debug switches enabled:
+
+  CONFIG_SETUP_SSR_NOTIF_TIMEOUTS=y
+  CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT=y      (its own help says "debugging feature")
+  CONFIG_QCOM_FORCE_WDOG_BITE_ON_PANIC=y
+  CONFIG_EDAC_KRYO_ARM64_PANIC_ON_UE=y
+  CONFIG_PANIC_TIMEOUT=5
+
+With them, any subsystem (ADSP/modem/venus/cdsp) sysmon communication or
+notifier chain taking longer than SSR_SUBSYS_NOTIF_TIMEOUT (20 s) calls
+panic(), and FORCE_WDOG_BITE_ON_PANIC turns that panic into an immediate
+hardware watchdog reset - a transient subsystem hiccup therefore reboots the
+device.
+
+Turn them all off: the timeout only warns, an uncorrectable ECC error is logged
+instead of fatal, and a panic no longer auto-reboots after 5 s.  The trade-off
+is less debugging information when a subsystem fails.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ arch/arm64/configs/h130_factory.config | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm64/configs/h130_factory.config b/arch/arm64/configs/h130_factory.config
+index 1de0d58a3..92bd38cea 100755
+--- a/arch/arm64/configs/h130_factory.config
++++ b/arch/arm64/configs/h130_factory.config
+@@ -2215,7 +2215,6 @@ CONFIG_INPUT_MXM1120_UP=y
+ # CONFIG_INPUT_MXM1120_MIDDLE is not set
+ CONFIG_INPUT_MXM1120_DOWN=y
+ CONFIG_INPUT_IST8801=y
+-CONFIG_INPUT_IST8801=y
+ 
+ #
+ # Hardware I/O ports
+@@ -4149,7 +4148,7 @@ CONFIG_EDAC_LEGACY_SYSFS=y
+ CONFIG_EDAC_KRYO_ARM64=y
+ # CONFIG_EDAC_KRYO_ARM64_POLL is not set
+ # CONFIG_EDAC_KRYO_ARM64_PANIC_ON_CE is not set
+-CONFIG_EDAC_KRYO_ARM64_PANIC_ON_UE=y
++# CONFIG_EDAC_KRYO_ARM64_PANIC_ON_UE is not set
+ # CONFIG_EDAC_GIC is not set
+ # CONFIG_EDAC_XGENE is not set
+ # CONFIG_EDAC_CORTEX_ARM64 is not set
+@@ -4701,7 +4700,7 @@ CONFIG_QCOM_SCM=y
+ CONFIG_QCOM_MEMORY_DUMP_V2=y
+ # CONFIG_MSM_DEBUG_LAR_UNLOCK is not set
+ CONFIG_QCOM_WATCHDOG_V2=y
+-CONFIG_QCOM_FORCE_WDOG_BITE_ON_PANIC=y
++# CONFIG_QCOM_FORCE_WDOG_BITE_ON_PANIC is not set
+ # CONFIG_QCOM_WDOG_IPI_ENABLE is not set
+ CONFIG_QCOM_SMEM_STATE=y
+ CONFIG_QCOM_SMP2P=y
+@@ -4715,10 +4714,10 @@ CONFIG_MSM_PIL=y
+ CONFIG_MSM_SYSMON_QMI_COMM=y
+ CONFIG_MSM_PIL_SSR_GENERIC=y
+ # CONFIG_MSM_PIL_MSS_QDSP6V5 is not set
+-CONFIG_SETUP_SSR_NOTIF_TIMEOUTS=y
++# CONFIG_SETUP_SSR_NOTIF_TIMEOUTS is not set
+ CONFIG_SSR_SYSMON_NOTIF_TIMEOUT=20000
+ CONFIG_SSR_SUBSYS_NOTIF_TIMEOUT=20000
+-CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT=y
++# CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT is not set
+ CONFIG_MSM_BOOT_STATS=y
+ # CONFIG_MSM_BOOT_TIME_MARKER is not set
+ # CONFIG_MSM_CORE_HANG_DETECT is not set
+@@ -5547,7 +5546,7 @@ CONFIG_CC_HAS_SANCOV_TRACE_PC=y
+ # CONFIG_WQ_WATCHDOG is not set
+ # CONFIG_PANIC_ON_OOPS is not set
+ CONFIG_PANIC_ON_OOPS_VALUE=0
+-CONFIG_PANIC_TIMEOUT=5
++# CONFIG_PANIC_TIMEOUT is not set
+ CONFIG_SCHED_DEBUG=y
+ CONFIG_SCHED_INFO=y
+ # CONFIG_PANIC_ON_SCHED_BUG is not set

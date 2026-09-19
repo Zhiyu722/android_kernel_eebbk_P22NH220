@@ -1,0 +1,1876 @@
+diff --git a/EEBBK_S6_changes.md b/EEBBK_S6_changes.md
+index adac64f37..776557d06 100755
+--- a/EEBBK_S6_changes.md
++++ b/EEBBK_S6_changes.md
+@@ -11,7 +11,11 @@
+ 
+ ## 一、根因
+ 
+-### 1. 无声：音频栈被编进内核，与厂商 DLKM 模块冲突
++### 1. 无声：`TECHPACK=n` 把 ADSP loader 挡在了内核之外
++
++> **更正**：本文档早期版本把根因写成「音频栈被编进内核、与厂商 DLKM 冲突」，
++> 那是错的。真机实测证明恰恰相反：**把音频栈编进内核才是修复**，
++> 而「不编」（`TECHPACK=n`）正是无声的原因。
+ 
+ 真机 `/vendor/lib/modules` 下有 **44 个厂商内核模块**，其中音频框架全部是模块：
+ 
+@@ -21,24 +25,143 @@ audio_machine_talos.ko  audio_q6.ko   audio_platform.ko ... (33 个音频模块)
+ qca_cld3_wlan.ko   wil6210.ko  br_netfilter.ko  lcd.ko  llcc_perfmon.ko ...
+ ```
+ 
+-真机 `lsmod`（原厂内核运行时）确认这些模块**正在工作**，功放 `aw882xx_dlkm`
+-引用计数为 3，`/proc/asound/cards` 有 `sm6150-wcd9375-snd-card`。
++原厂内核镜像里 **没有任何音频字符串**（`aw882xx/wcd937x/bolero` 计数均为 0），
++原厂确实是按 DLKM 方式构建的。**但这套 DLKM 在本仓库编出的内核上用不了**：
++它们是用厂商内核链接的，`struct module` / 符号 CRC 与本内核不兼容
++（实测 `module_layout` 期望 `0xcc8cac52`，本内核算出 `0x021f9ae4`）。
++
++于是本内核必须自带一份 **ABI 自洽** 的音频栈。而早期构建脚本传了 `TECHPACK=n`：
++
++```make
++# techpack/Kbuild
++TECHPACK?=y
++obj-${TECHPACK} += stub/ $(addsuffix /,$(subst $(srctree)/techpack/,,$(techpack-dirs)))
++```
++
++传 `n` 就只编 `stub/`。实测两种构建的内核里 techpack 目标文件数：
++
++| 构建 | `out/techpack` 下目标文件 | 结果 |
++|---|---|---|
++| `TECHPACK=n`（旧，错误） | **1 个**（空的 `techpack/built-in.o`） | 音频代码为 0，**无声卡，卡开机动画** |
++| `TECHPACK=y`（修复） | **87+ 个**（`asoc/` `dsp/` `ipc/` …） | 音频栈齐全 |
++
++**决定性的一环是 ADSP loader。** `techpack/audio/config/sm6150auto.conf`
++（由 `techpack/audio/Makefile` 在 `CONFIG_ARCH_SM6150=y` 时强制 include 并 export）
++里有 `CONFIG_MSM_ADSP_LOADER=y`，对应的
++`techpack/audio/dsp/adsp-loader.c` 是**唯一**会去拉起 ADSP 的代码：
++
++```c
++/* DT 里 qcom,adsp-state = <0>，且没有 qcom,proc-img-to-load → 走 load_adsp */
++adsp_state = apr_get_q6_state();
++if (adsp_state == APR_SUBSYS_DOWN) {
++        priv->pil_h = subsystem_get("adsp");   /* ← 载入 adsp.mbn，ADSP 起来 */
++```
++
++`TECHPACK=n` 时这段代码不在内核里，ADSP 永远不启动，于是真机上出现：
++
++```
++adsprpcd: apps_dev_init failed for domain 0, errno Transport endpoint is not connected  ← 死循环
++audio_hw_utils: audio_extn_utils_open_snd_mixer: retry, retry_num 18                    ← 无限重试
++/sys/class/sound/  → 只有 timer，没有 card0
++ServiceManager: Waiting for service 'media.audio_policy' …                              ← 开机永远完不成
++```
+ 
+-而本仓库默认构建方式（`.github/workflows/build.yml`：
+-`make O=out CC=clang vendor/sdmsteppe-perf_defconfig h130.config`）会把
+-`techpack/audio` **编进内核镜像**：
++`/dev/fastrpc-*` 打不开并返回 ENOTCONN，含义就是 **ADSP 远程处理器没在运行**。
++厂商的 `audio_adsp_loader.ko` 顶不上（同上，ABI 不兼容）。
+ 
+-* `techpack/audio/Makefile` 在 `CONFIG_ARCH_SM6150/ARCH_SDMMAGPIE=y` 时
+-  无条件 `include techpack/audio/config/sm6150auto.conf` 并 `export`，
+-  该文件把 `CONFIG_SND_SOC_WCD937X=y`、`CONFIG_SND_SMARTPA_AW882XX=y` 等
+-  全部置 `y`；
+-* `techpack/Kbuild` 用 `TECHPACK?=y` 把 `techpack/audio` 挂进 `obj-y`。
++**修复 = 构建时不要再传 `TECHPACK=n`**（`techpack/Kbuild` 里 `TECHPACK?=y`
++本来就是默认值）。详见 `s6patch声音/README.md`。
++
++#### 1.1 设备树侧的证据（全部核对过，**无需改 DT**）
++
++`imgdata/boot.img` 的 dtb 段含 10 棵基础树，其中 `boot08` = **SDMMAGPIEP SoC**（本机）；
++`dtbo.img` 含 9 个覆盖层，其中带 `qcom,hall`（BBK 升降霍尔）与 bbk/h130 标记的
++`dtbo02/04/05/07` 是 BBK 的覆盖层。四处关键节点：
++
++```
++boot08.dts:17336   qcom,msm-adsp-loader { status="ok"; compatible="qcom,adsp-loader";
++                                          qcom,adsp-state = <0x00>; }
++boot08.dts:~4471   qcom,lpass@62400000 { compatible="qcom,pil-tz-generic";
++                                          qcom,pas-id=<0x01>;
++                                          qcom,firmware-name="adsp";      ← 载入 adsp.mbn
++                                          mbox-names="adsp-pil"; }
++boot08.dts:17226   sound { compatible = "qcom,sm6150-asoc-snd"; … }       ← 匹配内置 sm6150.c
++dtbo04.dts:4342    fragment@54 → __overlay__ { qcom,model = "sm6150-wcd9375-snd-card";
++                                               compatible = "qcom,sm6150-asoc-snd";
++                                               status = "ok"; }
++```
++
++* 内置机驱动 `techpack/audio/asoc/sm6150.c` 用
++  `snd_soc_of_parse_card_name(card, "qcom,model")` 取卡名 →
++  运行时卡名就是 **`sm6150-wcd9375-snd-card`**（ALSA 截断为 `sm6150wcd9375sn`），
++  与厂商音频 HAL 的 `get_sndcard_id()` 期望一致；
++* 打包 `boot.img` 时 **dtb 段逐字节保留原厂**
++  （`mkboot2.py` 自检含 `chk("dtb == factory")`），且不刷 `dtbo`，
++  所以设备实际使用的树一定包含上述节点；
++* `adsp-loader.c` 的判定路径：DT `qcom,adsp-state = <0>`、无 `qcom,proc-img-to-load`
++  → `goto load_adsp` → `apr_get_q6_state()` 为 `APR_SUBSYS_DOWN`
++  → **`subsystem_get("adsp")`** → 绑定 `qcom,lpass@62400000` 载入 `adsp.mbn`。
++
++#### 1.2 第二层根因：机驱动硬编码了 TFA98xx，而本机是 AW882xx
++
++把音频栈编进内核后，日志给出了更具体的报错（关键两行）：
++
++```
++<6>[ 1.462112] [Awinic][2-0034]aw882xx_dai_drv_append_suffix: dai name [aw882xx-aif-2-34]
++<3>[10.442602] sm6150-asoc-snd ...: ASoC: CODEC DAI tfa98xx-aif-2-34 not registered
++```
++
++`techpack/audio/asoc/sm6150.c` 的 `populate_snd_card_dailinks()` 里有一段**本地改动**
++（带中文注释），把两个 MI2S 后端 link 的 legacy 单 codec 字段硬编码成 TFA98xx：
++
++```c
++msm_mi2s_be_dai_links[0].codec_name     = "tfa98xx.2-0034";
++msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
++msm_mi2s_be_dai_links[1].codec_name     = "tfa98xx.2-0036";
++msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
++```
++
++本机（P20H130）的功放**不是 TFA98xx**，而是 i2c 2-0034 / 2-0036 上的
++**AWINIC AW882xx**（驱动 probe 时打印 `aw882xx 1852 detected`），
++注册的 DAI 是 `aw882xx-aif-2-34` / `aw882xx-aif-2-36`。
++
++致命机制在 `sound/soc/soc-core.c`：
++
++```c
++static int snd_soc_init_multicodec(struct snd_soc_card *card,
++				   struct snd_soc_dai_link *dai_link)
++{
++	/* Legacy codec/codec_dai link is a single entry in multicodec */
++	if (dai_link->codec_name || dai_link->codec_of_node ||
++	    dai_link->codec_dai_name) {
++		dai_link->num_codecs = 1;
++		dai_link->codecs[0].name     = dai_link->codec_name;
++		dai_link->codecs[0].dai_name = dai_link->codec_dai_name;
++	}
++```
++
++只要 legacy 字段非空，link 就被收缩成「1 个 codec」，`codecs[0]` 被整体覆盖 →
++**同一文件里本来就正确的**表被丢弃：
++
++```c
++/* sm6150.c:6900，由 CONFIG_SND_SOC_AWINIC_AW882XX 选中 */
++struct snd_soc_dai_link_component awinic_codecs[] = {
++	{ .dai_name = "aw882xx-aif-2-34", .name = "aw882xx_smartpa.2-0034" },
++	{ .dai_name = "aw882xx-aif-2-36", .name = "aw882xx_smartpa.2-0036" },
++};
++```
+ 
+-结果：内核里有一份完整的 QCOM 音频栈，厂商的 `audio_*.ko` 加载失败
+-（驱动/i2c 设备重复注册），音频 HAL 拿不到声卡 → **无声**。
++→ `snd_soc_register_card()` 永远 `-EPROBE_DEFER` → 无 `card0` →
++音频 HAL 在 `get_sndcard_id()` 段错误 → 卡第二屏。
+ 
+-原厂内核镜像里 **没有任何音频字符串**（`aw882xx/wcd937x/bolero/msm-pcm-routing`
+-计数均为 0），证明原厂就是按 DLKM 方式构建的。
++**反证（原厂怎么做）**：从 `super_5.img` 提取的原厂机驱动 `machine_dlkm.ko`：
++
++* **没有** `dual speaker configured (34 & 36)` 这条字符串 → 那 4 行不是原厂代码；
++* 符号表里有 `aw882xx_dails`（**48 字节 = 2 × `snd_soc_dai_link_component`**）、
++  `tfa98xx_dails`、`fs16xx_codecs` → 原厂**一律用 `.codecs`/`.num_codecs` 组件表**，
++  从不走 legacy 字段。
++
++**修复**：删掉那 4 行，让 `awinic_codecs` 生效（`s6patch声音/0004`）。
+ 
+ ### 2. 后置相机失效：原厂相机节点补丁不在源码里
+ 
+@@ -114,23 +237,133 @@ reg[0x0703] = 0xff, ...
+ 
+ 可复现构建脚本，关键点：
+ 
+-* `TECHPACK=n`：把 techpack 排除出内核镜像（音频兼容修复的核心）；
++* **`TECHPACK=y`（关键，不要传 `TECHPACK=n`）**：让 `techpack/audio` 编进内核，
++  从而带上 ADSP loader 与整套音频栈 —— **这就是无声问题的修复**（见第一节）；
++  脚本里还加了编后自检，确认 `adsp-loader`/`bolero`/`wcd937x`/`aw882xx`
++  等符号真的进了 `Image.gz`；
+ * `LD=ld.lld`：发行版自带的 aarch64 GNU ld 2.38 会把 `.bss.rtic`
+   放错位置，链接报
+   `relocation truncated to fit: R_AARCH64_ADR_PREL_PG_HI21`，
+   用 LLVM lld 11 链接即可（原厂用的是 binutils 2.27，行为不同）；
++* `CONFIG_MODULE_SIG_FORCE=n`：厂商模块用原厂密钥签名，本内核验签必然失败；
+ * clang 11（`/usr/bin/clang-11`，即 Ubuntu clang 11.1.0）+ GNU binutils 汇编器。
+ 
+ ---
+ 
+-## 三、构建
++### 4. `arch/arm64/kernel/vmlinux.lds.S`（链接布局修复，必须）
++
++厂商脚本里 `.bss.rtic`（`__rticdata`，含 `selinux_state`）被放在
++`STABS_DEBUG`（`.stab 0 : {...}` 显式地址 0 的调试段）之后：
++
++* 当年的 binutils 2.27 会把同名 `.bss` 合并进镜像，所以没问题；
++* 现代链接器（GNU ld 2.38 / LLVM lld 11）要么报
++  `relocation R_AARCH64_ADR_PREL_PG_HI21 out of range`（段被放到地址 ≈0），
++  要么把段放到 `_end` 之后。
++
++**真机实测**：第一版修复（段放在 `_end` 之后）刷入后**卡在第一屏无法开机**。
++用 `nm` 检查符号地址确认了根因：
++
++```
++__bss_stop       = ffffff800a1e9560
++__bss_rtic_start = ffffff800a1f1000
++_end             = ffffff800a1f1000   <-- RTIC 段正好在 _end 之外
++selinux_state    = ffffff800a1f1000   <-- 会被页分配器复用并覆盖
++```
++
++内核只保留 `_text.._end` 的内存，`selinux_state` 落在保留区之外 → 启动即崩溃。
++最终修法：把 `.bss.rtic` 放在 `BSS_SECTION(0, 0, 0)` 之后、`_end` 之前
++（镜像内部、页对齐），修复后：
++
++```
++__bss_rtic_start = ffffff800a1ea000
++selinux_state    = ffffff800a1ea000   <-- 在 _end 之内
++_end             = ffffff800a1f2000
++```
++
++刷入后设备正常开机（`Linux version 4.14.190-perf+ ... clang version 11.1.0-6, LLD 11.1.0`）。
++
++### 5. `.scmversion`（vermagic 修复，必须）
++
++源码树里存在 `.git` 时，`scripts/setlocalversion` 会给出 `4.14.190-perf+`，
++而厂商 DLKM 模块记录的是 `4.14.190-perf`，**vermagic 不匹配会导致全部厂商模块
++拒绝加载**（实测：`lsmod` 只有 1 行、`sys.boot_completed` 一直为空、无声音）。
++
++修法：在源码根目录放一个空的 `.scmversion`（本仓库已包含），
++`make kernelrelease` 即回到 `4.14.190-perf`，与厂商模块一致。
++（用本仓库 `.github/workflows/build.yml` 的 CI 方式构建时没有 `.git`，不受影响。）
++
++### 6. `kernel/module.c`（放行厂商 DLKM 的符号 CRC，必须）
++
++厂商模块带 `CONFIG_MODVERSIONS` 的符号 CRC，且是在完整厂商树里算出来的
++（实测 `module_layout` 期望 `0xcc8cac52`，本内核算出 `0x021f9ae4`）。
++`CONFIG_MODVERSIONS` 不能关——`modversions` 是 vermagic 字符串的一部分，
++关掉会变成 `… mod_unload aarch64`，与厂商模块
++`… mod_unload modversions aarch64` 不匹配，反而更糟。
++
++修法：把 `check_version()` 的 `bad_version` 分支改为「只警告、返回 1（接受）」，
++等价 `modprobe --force`。实测 `lsmod` 从 1 → 35，
++厂商音频 HAL 也不再在 `get_sndcard_id()` 段错误。
++
++> 注意：这一步**只解决「模块装不上」，不解决「没声音」**。
++> 真正让声音回来的还是第 3 条的 `TECHPACK=y`。
++
++---
++
++## 三、真机验证结果（adb / fastboot）
++
++设备：EEBBK S6（`ro.boot.serialno=2fa7c794`，Android 11，非 A/B，boot 分区 64MB）
++
++| 检查项 | 原厂内核 | 旧构建 `TECHPACK=n` | `TECHPACK=y`（未修 codec 名） | **最终 `boot_audio2.img`（实测）** |
++|---|---|---|---|---|
++| 内核启动 | ✓ | ✓ | ✓ | ✓ `clang 11.1.0 / LLD` `#2` |
++| `/proc/driver/BackCamera_info` | 存在 | ✓ | ✓ | **✓** |
++| `/proc/driver/FrontCamera_info` | 存在 | ✓ | ✓ | **✓** |
++| `dumpsys media.camera` | 2 | 1（仅后摄） | 1 | **1（仅后摄，前摄需原厂私有 sensor 代码）** |
++| `/sys/class/sound/card0` | 有 | **无（只有 `timer`）** | **无（只有 `timer`）** | **有 ✅ 23 个 `pcmC0D*p` 播放设备 + 12 个 `comprC0D*`** |
++| 声卡名 | `sm6150-wcd9375-snd-card` | — | — | **HAL 打印 `snd_card_name: sm6150-wcd9375-snd-card`，`Opened sound card:0` ✅** |
++| 音频 HAL 崩溃 | 无 | `get_sndcard_id+572` SIGSEGV 反复 | 同左 | **无 ✅** |
++| `adsprpcd` | 正常 | `Transport endpoint is not connected` 死循环 | 不再报错 | **不再报错，3 进程稳定 ✅** |
++| `sys.boot_completed` | 1 | **空（卡开机动画）** | **空（卡开机动画）** | **`1` ✅** |
++| `init.svc.bootanim` | stopped | running | running | **stopped ✅** |
++| 框架路由到扬声器 | ✓ | ✗ | ✗ | **`AudioFlinger: Output thread AudioOut_D → Output devices: 0x2 (AUDIO_DEVICE_OUT_SPEAKER)`，`CFG_EVENT_CREATE_AUDIO_PATCH: new device 0x2` ✅** |
++| 升降/霍尔等 BBK 节点 | 有驱动 | 无驱动 | 无驱动 | 无驱动（源码缺 BBK 私有驱动） |
++
++### 关键差异：内核里有没有 ADSP loader
++
++```
++旧构建（TECHPACK=n）Image.gz 里的音频符号：
++  aw882xx 0    wcd937x 0    bolero 0    adsp-loader 0    q6afe 0     ← 全部为 0
++
++新构建（TECHPACK=y）Image.gz 里的音频符号：
++  adsp-loader 2    q6afe 8    bolero 19    wcd937x 30    aw882xx 27
++```
++
++旧构建「卡开机动画」的完整因果链：
+ 
+-```bash
+-# 在 WSL/Linux 里（clang-11、ld.lld、dtc、bison、flex、libssl-dev、bc 已装）
+-cd android_kernel_eebbk_sm6150
+-./build_eebbk_clang11.sh
+-# 产物：out/arch/arm64/boot/Image.gz  （vermagic 4.14.190-perf）
+ ```
++TECHPACK=n → 内核无 adsp-loader.c → qcom,adsp-loader 节点无人绑定
++          → subsystem_get("adsp") 从不调用 → ADSP 不启动
++          → /dev/fastrpc-* 返回 ENOTCONN → adsprpcd 死循环
++          → 音频 HAL 的 open_snd_mixer 无限重试（retry_num 18…）
++          → audioserver 无法发布 media.audio_policy
++          → SystemServer 一直等 → 开机永远完不成
++```
++
++这也解释了为什么「CRC 放行让厂商模块装上（`lsmod` 1 → 35）」之后仍然无声：
++模块装得上，但 **ADSP 依然没人去拉起**。
++
++刷机要点（实测）：
++
++* 本机 **只有在 fastbootd 模式下** `fastboot flash boot` 才被接受
++  （bootloader 模式返回 `unknown command`）；
++* fastbootd 下 `fastboot getvar is-userspace` 返回 `yes`、
++  `getvar product` 返回 `sm6150`（**据此判断当前模式**）；
++* 原厂 `imgdata/boot.img` 可直接刷回恢复，功能正常。
++
++> 提醒：本仓库源码缺少 BBK 私有驱动，因此自编译内核在真机上会
++> 丢失升降前摄/霍尔/传感器/ramext 等功能。但**声音与相机这两项不依赖它们**，
++> 由本仓库自带的音频栈 + 相机 proc 补丁实现。
++
+ 
+ ## 四、已知未覆盖项（源码本身缺失，非本次改动引入）
+ 
+@@ -142,7 +375,98 @@ cd android_kernel_eebbk_sm6150
+ 
+ 这些都不影响本次两项修复，但如果后续需要完全还原原厂功能，需要补齐上述驱动。
+ 
+-## 五、升降前摄（“打开相机自动升起”）结论
++## 五、触摸：锁屏后卡顿 + 触摸乱上报（第三项修复）
++
++症状：**锁屏后系统非常卡**，日志里**触摸事件乱上报**。
++
++### 根因
++
++`drivers/input/touchscreen/focaltech_touch/focaltech_core.c` 用 `#if/#elif` 链
++选择「熄屏通知器」：
++
++```c
++#if defined(CONFIG_FB)
++    ts_data->fb_notif.notifier_call = fb_notifier_callback;
++    ret = fb_register_client(&ts_data->fb_notif);          /* ← 实际编译进了这条 */
++#elif defined(CONFIG_DRM)
++    ts_data->fb_notif.notifier_call = drm_notifier_callback;
++#if defined(CONFIG_DRM_PANEL)
++    ... drm_panel_notifier_register(active_panel, ...)
++#else
++    ... msm_drm_register_client(&ts_data->fb_notif)
++#endif
++#endif
++```
++
++本内核 **`CONFIG_FB=y` 与 `CONFIG_DRM=y` 同时开启**，屏幕由 **MSM DRM（SDE）** 驱动，
++所以注册的是**旧的 fb_notifier** —— MSM DRM 显示**永远不会触发** FB blank 事件。
++本树里的直接证据：
++
++```
++drivers/gpu/drm/msm/msm_atomic.c:266  msm_drm_notifier_call_chain(MSM_DRM_EARLY_EVENT_BLANK, ...)
++drivers/gpu/drm/msm/msm_atomic.c:287  msm_drm_notifier_call_chain(MSM_DRM_EVENT_BLANK, ...)
++```
++
++而 `fts_ts_suspend()` / `fts_ts_resume()` 的调用点**只**在这些通知回调里
++（`fb_notifier_callback` / `drm_notifier_callback`），i2c 驱动上也没有
++`dev_pm_ops`（`FTS_PATCH_COMERR_PM == 0`）：
++
++```c
++#if defined(CONFIG_PM) && FTS_PATCH_COMERR_PM
++        .pm = &fts_dev_pm_ops,
++#endif
++```
++
++结果熄屏后触摸控制器**一直醒着、IRQ 一直开着**：
++
++* IRQ 持续触发 → 线程化中断反复做 i2c 读 → CPU 被反复唤醒 → **锁屏后很卡**；
++* 读回的脏数据被当成触摸点上报 → **触摸乱上报**。
++
++> 驱动来源：`README.txt` 自述「取自 Firefly RK3399 公开源码…**本驱动在 EEBBK S5 测试可用**
++> By XiKoTaSu」，是从 S5 移植的第三方通用版本，显示框架不匹配正是此类移植的典型坑。
++
++### 修法
++
++按**本树自己的既有约定**判别与注册，不引入新机制：
++
++* `st/fts.c`：只在 `CONFIG_FB_MSM`（旧 MSM framebuffer）时才走 fb 路径；
++* `hxchipset/himax_common.c`：`#ifdef CONFIG_DRM` + `msm_drm_register_client()`。
++
++因此把判别条件由 `CONFIG_FB` 改为 `CONFIG_FB_MSM`，注册 msm_drm 客户端：
++
++```c
++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++    ts_data->fb_notif.notifier_call = drm_notifier_callback;
++    ret = msm_drm_register_client(&ts_data->fb_notif);
++    if (ret)
++        FTS_ERROR("[DRM]Unable to register msm_drm notifier: %d\n", ret);
++    else
++        FTS_INFO("[DRM]msm_drm notifier registered for blank/unblank");
++```
++
++同时修掉两个同源问题：
++
++* `<linux/msm_drm_notify.h>` 原先只被包含在**不可达**的 `CONFIG_DRM_PANEL` 的 `#else` 分支里；
++* 只匹配 `DRM_PANEL_*` 事件的那个 `drm_notifier_callback` 变体被排除，改用匹配
++  `MSM_DRM_*` 事件的变体（与 `msm_drm_register_client()` 配对）。
++
++### 验证（离线，已通过）
++
++```
++focaltech_core.o 重新编译：0 warning / 0 error
++Image.gz 内：
++  msm_drm_register_client / msm_drm_unregister_client      1 / 1
++  msm_drm notifier registered for blank/unblank            1
++  Unable to register fb_notifier                           0   ← 旧 fb 路径已不再编译
++  adsp-loader 2 · driver/BackCamera_info 1                      ← 音频/相机修复未受影响
++打包：kernel == Image.gz / ramdisk == factory / dtb == factory   → ALL CHECKS PASSED
++```
++
++刷入后锁屏应能看到 `logcat -s FTS_TS` 出现
++`[DRM]msm_drm notifier registered for blank/unblank` 与 `DRM event:…,blank:…`，
++且熄屏后 `getevent -lt /dev/input/event2` 不再有事件。
++
++## 六、升降前摄（“打开相机自动升起”）结论
+ 
+ **这套逻辑确实在内核里，但驱动源码不在本仓库、也不在任何公开仓库中。**
+ 
+@@ -201,3 +525,580 @@ bbk_hall_vendor
+ （后摄 id=0、前摄 id=1），若 App/HAL 是先读 `FrontCamera_info` 再触发升降机构，
+ 则本次修复对前摄也有帮助。
+ 
++
++
++---
++
++## 七、真机刷机排查全过程（最终结论：`TECHPACK=n` 把 ADSP loader 挡在内核之外）
++
++按顺序踩到并解决/定位的问题，全部有真机证据：
++
++| # | 现象 | 根因 | 状态 |
++|---|---|---|---|
++| 1 | 刷入后卡**第一屏** | `.bss.rtic`（含 `selinux_state`）被链接到 `_end` 之外，运行时被页分配器覆盖 | 已修（`vmlinux.lds.S`） |
++| 2 | 卡**第二屏**、`lsmod` 只有 1 行 | 源码树带 `.git` → vermagic 变 `4.14.190-perf+`，厂商模块拒装 | 已修（空 `.scmversion`） |
++| 3 | 仍 `lsmod`=1 | `CONFIG_MODULE_SIG_FORCE=y` 只认本内核密钥签名的模块 | 已修（`SIG_FORCE=n`，vermagic 不变） |
++| 4 | 仍 `lsmod`=1 | `CONFIG_MODVERSIONS` 符号 CRC 不匹配（源码缺 BBK 补丁） | 已修（`kernel/module.c` 的 `bad_version` 改为接受，等价 `modprobe --force`；保留 `MODVERSIONS=y` 维持 vermagic） |
++| 5 | 模块终于装上（35 个）、音频 HAL 不再崩，但**声卡仍建不出来** → 卡第二屏 | `/sys/class/sound/` 只有 `timer`；`audio_extn_utils_open_snd_mixer` 无限重试；`adsprpcd` 报 `Transport endpoint is not connected` → **ADSP 没起来**；i2c `2-0034` 无驱动绑定 | 已定位：内核里没有 ADSP loader |
++| 6 | 上述根因 | 构建脚本传了 `TECHPACK=n` → `techpack/Kbuild` 只编 `stub/` → 内核里没有 `adsp-loader.c`，`subsystem_get("adsp")` 从不调用；厂商 `audio_adsp_loader.ko` 又因 ABI 不兼容顶不上 | **已修**：改为 `TECHPACK=y`（即不传 `TECHPACK=n`），音频栈 + ADSP loader 全部内置 |
++
++对照原厂内核（同机实测）：`sys.boot_completed=1`、**36 个模块全部加载**、
++`/proc/asound/cards` 有 `sm6150-wcd9375-snd-card`、`aw882xx_dlkm` 工作中。
++本修复不依赖那批厂商模块，而是让内核自带一份 ABI 自洽的音频栈。
++
++### 交付与交接建议
++
++* 相机 proc 补丁 + 链接布局修复：`s6patch相机/`、`dist/eebbk_s6_camera_proc.patch`
++* 声音修复：`s6patch声音/`
++* 构建要点：clang-11 + `ld.lld`、**`TECHPACK=y`（不要传 `n`）**、空 `.scmversion`；
++  还需 `CONFIG_MODULE_SIG_FORCE=n` + `module.c` CRC 放行（供非音频的厂商模块加载）
++* 可刷镜像：`dist/boot_native.img`（`TECHPACK=y`，音频栈已内置并自检通过）
++* 设备恢复：`fastboot flash boot imgdata/boot.img`
++
++### 刷机备忘（本机特有）
++
++* 只有 **fastbootd**（`fastboot getvar is-userspace` = `yes` 且接受 `flash`）能刷 `boot`；
++  实测三种模式的差别：
++  | 进入方式 | `fastboot devices` 序列号 | `flash boot` 结果 |
++  |---|---|---|
++  | **手动进入 fastbootd** | `2fa7c794` | ✅ 成功 |
++  | `adb reboot fastboot` | `0123456789ABCDEF` | ✗ `Unrecognized command download` |
++  | 上一步后再 `fastboot reboot bootloader` | `2fa7c794` | ✗ `unknown command`（这是 ABL） |
++* 刷自定义 boot 会覆盖 Magisk 的 ramdisk（root 消失）
++* 原厂 `imgdata/boot.img`（64 MB，与分区等大）随时可刷回
++
++### 关于 QMMI（高通的工厂测试 App，与本次内核改动无关）
++
++用本内核时曾出现「开机后进入 QMMI 测试界面」的现象，实测**不是内核造成的**：
++
++* 原厂内核下 QMMI 进程**同样**会在开机时被拉起
++  （`ActivityManager: Start proc ... for broadcast {com.qualcomm.qti.qmmi/com.qualcomm.qti.qmmi.framework.QmmiReceiver}`）；
++* 差别只在于是否抢占前台：原厂内核下前台是 `com.bbk.studyos.launcher`，那次是本内核下
++  `QmmiReceiver.startMainActivity` 被调用、QMMI 的 `MainActivity` 成了前台。
++* QMMI 监听 `android.intent.action.BOOT_COMPLETED` 与 `android_secret_code`（`7664` = QMMI），
++  属于 ROM/工厂测试状态，不是启动模式；`fastboot flash boot imgdata/boot.img` 并正常重启后已回到桌面。
++
++排查中同时确认：QMMI 的 APK（`/system_ext/app/Qmmi/Qmmi.apk`）是**加密封装**
++（`unzip` 报 "End-of-central-directory signature not found"），
++与之前 `BBKCamera.apk` 的 BPK 情况一致，无法直接静态分析。
++
++---
++
++## 八、升降前摄接口（供后续逆向重写驱动）
++
++真机原厂内核下抓到的完整接口：
++
++```
++/sys/devices/platform/soc/soc:bbk_vib_pwm/   driver=bbk_vib_pwm, 带 of_node + input/
++  vib_pwm_camera_state      <-- 0=收回 1=升起 2=升起并偏转（用户确认的原厂逻辑）
++  vib_pwm_elevator_mode / vib_pwm_elevator_row_shift / vib_pwm_holder_mode
++  vib_pwm_cali / vib_pwm_clear_cali_data / vib_pwm_up_down_count / vib_pwm_count
++  vib_pwm_dir / vib_pwm_freq / vib_pwm_time / vib_pwm_enable / vib_pwm_id
++  vib_pwm_state_init / vib_pwm_abort_notify
++```
++
++状态机线索（原厂内核字符串）：`[LYQ-damon-vib] Start change camera_state from [%d] to [%d]`、
++`damon enter vib_pwm_set_camera`、`RESTART_CAMERA_ELEVATOR to elevator_mode %d`、
++`damon enter handle input KEY_CAMERA_PRESS_MOVE & because: hall_up - hall_down < (cali_data.position1.hall_up_down_diff ...)`、
++`[LYQ-damon-hall] detect press`、`damon hall sensor is not cali`；
++校准数据在 `/mnt/vendor/persist/sensors/`（`cali_hall`、`up_down_count`）。
++
++设备树：`hall` 节点（`compatible="qcom,hall"`、GPIO93 中断）在 dtbo 覆盖层；
++`bbk_vib_pwm` 节点不在 `imgdata` 的 dtbo/boot DTB 里，说明设备上是原厂那份 dtbo
++—— **不要刷用本仓库编译的 dtbo，否则 hall/vib 节点会丢**。
++
++---
++
++## 九、通知声 / 锁屏提示音 / 升降下降凸起（2026-09-19 补充）
++
++本节针对真机上另外三个问题，全部实测确认；本节结论**不涉及本仓库源码改动**
++（升降下降那条走的是原厂校准接口），因此仓库里的 `drivers/misc/gpio_pwm.c` 保持原样。
++
++### 1. 通知声没有（已修复）
++
++通知走 **混音通路**（`AudioOut_D`，`AUDIO_OUTPUT_FLAG_PRIMARY|FAST`），媒体走
++**offload 直通 DSP** 通路（`usecase(3: compress-offload-playback)`），两者音量互不影响，
++所以会出现“媒体一直正常、只有通知不响”。
++
++| 现象 | 证据（真机） | 处理 |
++|---|---|---|
++| 扬声器的铃声/通知音量只有 3/15 | `AF::Track: setFinalVolume:0.063096`（≈ -24 dB） | `settings put system volume_ring_speaker 15` + 音量键，增益升到 `0.39~1.0` |
++| 用久了所有声音全哑（含媒体） | HAL 的 awinic VI feedback 每次启动都失败：`pcm start for TX failed` → `iv_feedback_count = 2, can't stop feedback!`；内核对应 `SM6150 ASM Loopback: ASoC: no backend DAIs enabled` | 重启即恢复（已实测）；根治见第 4 条 |
++
++### 2. 锁屏提示音没有（已修复）
++
++该 ROM 的锁屏音取自设置项里的**文件路径**，为空时回退到 framework 中并不存在的
++`R.raw.lock`（解析 `framework-res.apk` 的 `resources.arsc` 可确认 raw 类型只有
++loaderror / nodomain / color_fade_* / fallback_categories / fallbackring 六个条目）。
++
++```bash
++settings put global lock_sound   /product/media/audio/ui/Lock.ogg
++settings put global unlock_sound /product/media/audio/ui/Unlock.ogg
++```
++
++`/product/media/audio/ui/` 里本就有完整的 Lock.ogg / Unlock.ogg；`/system/media/audio/ui/`
++只剩 3 个文件，所以截屏声正常而锁屏声缺失。实测锁屏、解锁各产生一次 SoundPool 播放
++（`setFinalVolume 0.126` / `0.309`）。
++
++### 3. 升降前摄降到底后仍有明显凸起（已修复）
++
++机制：驱动按 `all_time`（校准里的 `cali_time`）开环驱动，应用请求 `MID→DOWN` 时
++下降时长与上升相同：
++
++```
++vib_pwm_move_to: want 1, current 0 -> up for 1941 ms, retry 3
++vib_pwm_move_to: want 0, current 1 -> down for 1941 ms, retry 3
++```
++
++实际驱动时间 = `time_ms × 6/10`（`VIB_PWM_MOVE_NUM/DEN`，19200 Hz 标称值折算到 32000 Hz）。
++原厂靠霍尔闭环（`add_time` 重试）补上下降行程，而本机霍尔一直 standby
++（`bbk_hall_data = up:-2000 down:-2000`），闭环失效 → 每次下降都差一截。
++
++**修法（不改内核、不刷机）**：`/dev/bbk_hall_core` 是 0666 的 misc 设备，其 ioctl 会把
++56 字节校准结构体拷进内核并调用 `set_vib_all_time()`：
++
++| ioctl | 作用 |
++|---|---|
++| `0x40046000` `BBK_HALL_CORE_IOCTL_SET_CALI` | 写入并持久化到 `/mnt/vendor/persist/sensors/cali_hall` |
++| `0x40046001` `BBK_HALL_CORE_IOCTL_TRANS_CALI` | 只改内存（重启还原，适合试值） |
++
++`struct hall_cali_data` 共 56 字节，`int cali_time` 位于 `+0x34`。
++工具源码见 `patch+++/tools/elev.c`，静态 aarch64 二进制随交付。
++
++```bash
++adb push elev /data/local/tmp/elev && adb shell chmod 755 /data/local/tmp/elev
++adb shell /data/local/tmp/elev trans 3630   # 试值：重启还原
++adb shell /data/local/tmp/elev set   3630   # 定值：写入 persist，重启保持
++```
++
++**采用值：`cali_time` 2790 → 3630（+30%）**，实测升降时长 1941 → 2526 ms，
++相机 App 升起→退出后**降到底贴合、无凸起**，升起高度正常。回退：
++`/data/local/tmp/elev set 2790`。
++
++> 注意：用 sysfs 直接写 `vib_pwm_camera_state` 与相机 App 的真实流程结果不同，
++> 只有直接写 sysfs 时会看到凸起；以相机 App 的实测为准。
++
++### 4. 未完成项与风险
++
++* **awinic VI feedback / `SM6150 ASM Loopback` 无后端 DAI 未根治**：这是“用久了全哑”的
++  根源。HAL（`/vendor/lib64/hw/audio.primary.sm6150.so`）里的
++  `audio_extn_aw882xx_start_feedback` 用 `msm-pcm-loopback`（MultiMedia6）做 VI feedback，
++  该 FE 没有后端 DAI 导致 `pcm start for TX failed`。根治方向：给该 FE 配后端 DAI，
++  或在 HAL 侧关掉 feedback（该库含 `vendor.audio.feature.dsm_feedback.enable` 等字符串）。
++* **内核重编后两次卡开机**（原因未查明）：两次分别用“增量重编”和“删除 out_native 全新编译”
++  构建，均卡在开机画面（USB 不枚举），对照刷回旧镜像立刻正常。已排除：编译配置
++  （内嵌 `.config` 逐行相同）、编译器（clang 11.1.0-6 / LLD 11.1.0）、链接器、模块兼容性
++  （`wlan.ko` 的 387 个符号 CRC 与新版 `Module.symvers` 全部一致）、源码差异
++  （仅 `gpio_pwm.c`/`kernel.h`/`module.c` 三处良性改动）。因此升降的下降补偿改用校准方案。
++  未验证的 `down_extra_permille` 改动保留为
++  `patch+++/optional-elevator-down-margin.patch`，**未合入**。
++* **霍尔仍 standby**（`up:-2000 down:-2000`），闭环未恢复。
++
++---
++
++## 十、霍尔传感器：驱动层已修好，但服务侧闭环会让升降“卡一半”（2026-09-19）
++
++### 1. 结论先说
++* **硬件和驱动都没坏**：两颗 MXM1120（`magnachip@0c`=down、`magnachip@0f`=up，I2C-2）
++  ID 都是 `0x9c`，I2C 读写正常。
++* 之前霍尔一直“standby（`bbk_hall_data` 显示 -2000）”是**本仓库驱动的有意行为**：
++  `drivers/input/misc/mxm1120.c` 的 `m1120_set_operation_mode()` 只写了模式位 `0x40`，
++  没有置原厂的 START 位（`mode | 0x09`），芯片因此从不开始转换，
++  `0x10` 块的 DRDY（bit0）永远为 0 → 每个采样都被判为无效。
++* 置上 START 后**霍尔立即正常工作**（见下），但一旦有有效采样，
++  `com.eebbk.camera` 的竖升只会到 **MID（约 70%）就停住**（用户所说“卡一半”），
++  这正是当年把霍尔留在 standby 的原因。服务侧（camera 服务内的
++  `EEBBK/ElevatorCmdQueThread`）我们改不了，所以**霍尔改动暂不合入**。
++
++### 2. 实测：置 START 后霍尔数据有效且随位置变化
++`opmode 0x49`（= `0x40 | 0x09`）后，`/sys/bus/i2c/drivers/mxm1120/…/dump` 的 `0x10` 块
++读到 `[10]=01`（DRDY 置位），`bbk_hall_data` 不再是 -2000：
++
++| 升降位置 | up | down |
++|---|---|---|
++| DOWN (0) | 1 | -721 |
++| MID (1) | 1 | -542 |
++| FULL (2) | -513 | -515 |
++| HOLDER (7) | -513 | -514 |
++| 再回 DOWN | 1 | -723（可复现） |
++
++### 3. 过程中发现并修正的一件事
++之前为了改行程时间用 `SET_CALI` 持久化时，把同一块 56 字节 blob 里
++**霍尔位置标定点写成了 0**（原本是负值）。虽然实测它**不是**“卡一半”的原因
++（重建标定后 App 仍然卡一半），但 0 值标定本身是错的，现已按上表实测值重建并写回
++`/mnt/vendor/persist/sensors/cali_hall`：
++
++```
++pos0   up=1  down=-721  diff=722      pos1   up=1  down=-718  diff=719
++pos24  up=1  down=-659  diff=660      pos6   up=1  down=-706  diff=707
++pos48  up=1  down=-598  diff=599      pos696 up=1  down=-542  diff=543
++cali_time = 3630
++```
++
++写 blob 的工具：`/data/local/tmp/elev setfile <blob>`（源码见 `patch+++/tools/elev.c`）。
++
++### 4. 顺便解决：内核重编后“卡在开机画面”的原因
++仓库自带的 `build_eebbk_clang11.sh` **能编出正常开机的内核**（本次实测
++`boot_hall.img`，内核 `#1`，正常启动）。之前两次卡开机是我用临时 `make` 命令
++（复用既有 `out_native/.config`、没有先删 out 目录、没有走脚本的两遍 `olddefconfig`
++与 `CONFIG_MODULE_SIG_FORCE` 处理）造成的构建状态问题。
++**以后一律用该脚本构建**，配置用 `arch/arm64/configs/` 下的文件
++（新增 `h130_debug.config` = 带 `CONFIG_BBK_DEBUG_BRINGUP=y` 的调试配置）。
++
++### 5. 当前状态与后续
++* 设备已刷回 `boot_elev_dbg.img`（内核 #52），霍尔回到 standby，
++  相机/升降行为与修复前一致（下降贴合靠 `cali_time=3630`）。
++* 霍尔补丁保留为 `patch+++/optional-hall-enable-start-bit.patch`，**未合入**。
++* 若将来要让霍尔闭环生效，需要继续做：查清 camera 服务在有有效采样时为何只升到 MID
++  （可能需要补它真正调用的接口或它的状态机所依赖的节点），以及把厂家的
++  `vib_pwm_state_move_sate`/`vib_pwm_state_init` 闭环路径补全。
++
++---
++
++## 十一、霍尔闭环修好并实测通过（2026-09-19 继续）
++
++上一节（第十节）的“暂不合入”结论已过时：霍尔已正式启用并修好，用户实测正常。
++
++### 1. 两处改动
++
++**(1) `drivers/input/misc/mxm1120.c` —— 置原厂 START 位，让芯片真正开始转换**
++
++`m1120_set_operation_mode()` 原来只写模式位 `0x40`；原厂是 `mode | 0x09`
++（bit0 START，bit3 同置）。现在写 `v | M1120_OP_MEASUREMENT | M1120_OP_START_SET`，
++停止时 `v & ~(M1120_OP_MEASUREMENT | M1120_OP_START)`。置位后 `0x10` 块的
++DRDY（bit0）置位，采样有效。
++
++**(2) `drivers/input/hall/bbk_hall_core.c` —— “被手推/被卡住”判定要求真正卡住**
++
++原判定 `queue_data_is_move_strong_press()` 只看 up/down 差值变化是否 >30 计数，
++而正常上升时该差值变化有 **179 计数**（down 通道从 -721 变到 -542），
++于是每次正常上升都在 ~460 ms 被误判成“被手推”，调用 `cancel_vib_hrtimer(0)`
++叫停电机 → 摄像头停在半路（“卡一半”），且状态被“修复”成 MID，
++服务随后的再次请求被当作“已在 MID”忽略。
++
++现在要求**移动队列填满且两个通道都静止**（真手推/真卡死会静止，正常移动不会）才中止。
++
++日志实证（同一次 `want 1 ... up for 2526 ms`）：
++
++```
++修复前: 120.65 move_to → 121.12 finish_move（约 460 ms，被中止）
++修复后:  33.49 move_to →  35.07 finish_move（约 1580 ms ≈ 2526×0.6，跑满）
++```
++
++### 2. 实测结果（用户确认）
++
++| 项目 | 结果 |
++|---|---|
++| 相机 App 升到位 | ✓ 不再卡一半 |
++| 退出后降到底 | ✓ 贴合 |
++| 霍尔数据 | ✓ 有效且随位置变化（DOWN `up:1 down:-721`、MID `up:1 down:-542`、FULL `up:-513 down:-515`，可复现） |
++| 媒体声 / 通知声 | ✓ 无回归 |
++
++### 3. 说明
++
++* 霍尔位置标定仍是按实测值重建的那一份（第十节第 3 条），已写入 persist。
++* 下降行程目前仍靠 `cali_time=3630`（厂家的 `add_time` 闭环重试还没在移动路径里实现）；
++  有了这次修复（真卡住能被识别），将来可以直接在这基础上加“下降不足自动补时间”。
++* 本节的改动已合入并推送，`patch+++/optional-hall-enable-start-bit.patch` 已删除
++  （内容变成正式提交）。
++
++## 十二、集成 ReSukiSU（KernelSU 的非 GKI 分支）：内核级 root（2026-09-19）
++
++### 1. 结论
++
++* 本内核现在自带 ReSukiSU（KernelSU 的社区分支，支持 3.4+ 非 GKI 内核）：
++  `CONFIG_KSU=y` + `CONFIG_KSU_MANUAL_HOOK=y`，跟着 `h130_debug.config` / `h130_release.config` 一起编译进 `Image.gz`，
++  不是 LKM、不需要额外刷 `init_boot`。
++* 4.14 没有 GKI2 的 syscall tracepoint，官方唯一可行方案是"手动钩子"，本仓库只改了 **4 个内核文件**
++  （`fs/stat.c`、`fs/exec.c`、`fs/open.c`、`kernel/reboot.c`）。
++* 另外三处钩子（setresuid / init.rc read / 输入设备）由 ReSukiSU 自带的 LSM 与 input handler 提供，
++  对应 `CONFIG_KSU_MANUAL_HOOK_AUTO_{SETUID,INITRC,INPUT}_HOOK`（默认 y），**源码不用动**。
++* ReSukiSU 在编译期会逐个 `grep` 钩子，缺一个就直接 `$(error)` 终止编译，所以"能不能编过"本身就是钩子齐全的证明。
++* 内核上报版本号 **35144**（= ReSukiSU v4.2.0-rc2 的 versionCode），
++  官方 Manager 要求内核 ≥ `Natives.MINIMAL_SUPPORTED_KERNEL = 35002`，且 `uapi/` 与 v4.2.0-rc2 **逐字节相同**，
++  因此配套 Manager 用 **v4.2.0-rc2**（`dist/ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk`）。
++
++### 2. 手动钩子落点（官方文档 3.14+ / 4.19- 两个分支的写法，已按本树 4.14 实际代码调整）
++
++| 文件 | 函数 | 插入的调用 | 编译期校验符号 |
++|---|---|---|---|
++| `fs/exec.c` | `do_execveat_common()` 声明之后、`IS_ERR(filename)` 之前 | `ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);` | `ksu_handle_execveat` |
++| `fs/exec.c` | `out_ret:` 之后、`putname(filename)` 之前 | `ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);` | （无强制校验） |
++| `fs/stat.c` | `newfstatat` / `fstatat64` / `compat newfstatat` | `ksu_handle_stat(&dfd, &filename, &flag);` | `ksu_handle_stat` |
++| `fs/stat.c` | `newfstat` / `fstat64` 的 `return error;` 之前 | `ksu_handle_newfstat_ret(&fd, &statbuf);` / `ksu_handle_fstat64_ret(&fd, &statbuf);` | `ksu_handle_newfstat_ret`、`ksu_handle_fstat64_ret` |
++| `fs/open.c` | `faccessat()` 内（4.19- 的写法：函数体直接写在 syscall 里） | `ksu_handle_faccessat(&dfd, &filename, &mode, NULL);` | `ksu_handle_faccessat` |
++| `kernel/reboot.c` | `SYSCALL_DEFINE4(reboot, ...)` 内 | `ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);` | `ksu_handle_sys_reboot` |
++| （无需改码） | setresuid / init.rc / input | `CONFIG_KSU_MANUAL_HOOK_AUTO_*_HOOK=y`（LSM） | 由 Kconfig 提供 |
++
++注意两点与官方文档的差异：
++
++1. 官方 3.14+ 的 diff 是针对 4.19+ 的 `do_execveat_common()` → `__do_execve_file()` 结构（把整个函数包一层）；
++   本树 4.14 的 `do_execveat_common()` 自己就是完整实现，所以入口钩子放函数开头、出口钩子放唯一的 `out_ret:`。
++   `ksu_handle_execve`（`const char *` 版本）是 **3.14 及更早**才允许的写法，4.14 用它会直接被 `manual_hook_check.mk` 判错。
++2. `fs/open.c` 的 4.19- 分支只钩 `faccessat`，本树 `SYSCALL_DEFINE2(access)` 走的是另一条路径，不钩也不会少功能。
++
++### 3. 没有做的两件事（以及原因）
++
++* **SUSFS**：保持 `# CONFIG_KSU_SUSFS is not set`。SUSFS 官方只支持 5.10+ GKI，而且它会把
++  `ksu_handle_stat()` / `ksu_handle_faccessat()` 的原型换成 `struct filename **` 版本，与上面的钩子写法冲突。
++* **"Static symbol export" 那 8 处去 `static`**（`write_op` / `sel_handle_status_ops` / `policy_rwlock` /
++  `sel_mutex` / `selinux_ops` / `security_dump_masked_av` / `context_struct_compute_av` / `selinux_status_page`）：
++  官方文档写明"打开 `CONFIG_KALLSYMS_ALL` 就可以不做这些改动"，本树两个 config 本来就 `CONFIG_KALLSYMS_ALL=y`，
++  编译期也因此跳过了这些检查（`KernelSU/kernel/tools/static_export_check.mk`）。
++
++### 4. 把 KernelSU 当"内置源码"而不是 submodule：3 处适配（都在 `KernelSU/kernel/Kbuild`）
++
++| # | 问题 | 处理 |
++|---|---|---|
++| 1 | 官方 `KernelSU/setup.sh` 用 `git clone` 把 KernelSU 做成 submodule；Kbuild 里 `test -e $(KSU_SRC)/../.git` 不成立就 `$(error)` | 本仓库把 KernelSU 源码**直接内置在仓库里**（submodule 在 tar/zip 交付中会丢，而且 git 不允许跟踪任何含 `.git` 的路径），改成打印一行提示 |
++| 2 | 版本号原本由 git 算：`30000 + commit 数 + 700` | 内置后没有 git 元数据，固定为 `KSU_LOCAL_VERSION := 4444` → `KSU_VERSION = 35144`，`KSU_VERSION_FULL = v4.2.0-rc2-vendored@ReSukiSU` |
++| 3 | `compat/kernel_compat.h` → `ss/policydb.h` → `ss/sidtab.h` → `"flask.h"`，而 `flask.h`/`av_permissions.h` 是 `security/selinux/Makefile` **生成到 obj 树**的；官方 in-tree 编译（obj == src）才能直接找到 | 补 `ccflags-y += -I$(objtree)/security/selinux`，并在 `build_eebbk_clang11.sh` 里先构建 `security/selinux/ init/`（`compile.h` 同理），顺带消掉 `-j` 并行时 `security/` 与 `drivers/` 的竞争 |
++
++### 5. 配置与构建
++
++```diff
++# arch/arm64/configs/h130_debug.config 与 h130_release.config 末尾
+++CONFIG_KSU=y
+++CONFIG_KSU_MANUAL_HOOK=y
+++# CONFIG_KSU_TRACEPOINT_HOOK is not set
+++CONFIG_KSU_DEBUG=y            # 仅调试版；正式版可去掉
+++CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+++# CONFIG_KSU_DISABLE_MANAGER is not set
++```
++
++```sh
++# 调试版（h130_debug.config：CONFIG_BBK_DEBUG_BRINGUP=y + KSU_DEBUG=y）
++OUT=out_ksu CONFIG=h130_debug.config TECHPACK_MODE=y ./build_eebbk_clang11.sh
++# 打包（内核 + 原厂 ramdisk + wlan.ko）
++python3 tools/mkboot3.py out_ksu/arch/arm64/boot/Image.gz boot_ksu_debug.img /root/wlan.ko
++```
++
++编译日志里的自检（`KernelSU/kernel/tools/manual_hook_check.mk`）：
++
++```
++-- ReSukiSU version code: 35144
++-- ReSukiSU version name: v4.2.0-rc2-vendored@ReSukiSU
++-- Supported Unofficial Manager: MKSU, RKSU, KOWSU, SukiSU-Ultra, ReSukiSU
++-- KERNEL_VERSION: 4.14
++-- KERNEL_TYPE: Non-GKI
++-- ReSukiSU: using Manual Hook
++-- ReSukiSU/manual_hook: You are using LSM hooks for setuid hooks.
++-- ReSukiSU/manual_hook: You are using LSM hooks for init rc hooks.
++-- ReSukiSU/manual_hook: ksu_handle_execveat found
++-- ReSukiSU/manual_hook: ksu_handle_faccessat found
++-- ReSukiSU/manual_hook: ksu_handle_stat found
++-- ReSukiSU/manual_hook: ksu_handle_newfstat_ret found
++-- ReSukiSU/manual_hook: ksu_handle_fstat64_ret found
++-- ReSukiSU/manual_hook: ksu_handle_sys_reboot found
++```
++
++若 `grep` 找不到某个符号，这里会直接变成 `$(error You should integrate ReSukiSU in your kernel.)` 并中断编译。
++
++### 6. 实机验证（2026-09-19，调试版镜像）
++
++镜像：`dist/boot_ksu_debug.img`（18776444 字节，md5 `4e99cd80950d99c0afaa45401d884c66`），
++由 `out_ksu`（`h130_debug.config`）的 `Image.gz` 打包，ramdisk 内仍带 `wlan.ko`。
++
++| 检查 | 结果 |
++|---|---|
++| 开机 | `sys.boot_completed=1` ✓ |
++| KernelSU 初始化 | `KernelSU: Initialized with driver version: 35144, full_version: v4.2.0-rc2-vendored@ReSukiSU, ABI: aarch64, Work mode: Built-in` ✓ |
++| 调试模式标志 | `KernelSU: shell is allowed at init!`（`CONFIG_KSU_DEBUG=y` 才会出现；调试版 adb shell 天然有 root，正式版不会） |
++| 功能注册 | `feature: registered handler for sulog / adb_root / selinux_hide` ✓ |
++| kallsyms | `grep -c ksu_handle /proc/kallsyms` = 30，六个强制钩子符号齐全 ✓ |
++| WiFi | `lsmod` 里 `wlan 3731456` 已加载 ✓ |
++| 霍尔 / 升降 | `id=0x9c`、`up:1 down:-722`；升降一次 2526 ms、`finish_move ... standby` ✓ |
++| 前序修复未回退 | 音频栈字符串仍在 `Image.gz`（adsp-loader/q6afe/bolero/wcd937x/aw882xx）✓ |
++
++App 侧（用户自装）验证：装上 `ReSukiSU_v4.2.0-rc2_35144-*.apk` 后应显示"工作中/已安装"，
++调试版还可以直接 `adb shell su -c id` 看到 `uid=0(root)`。
++
++### 7. 刷机与 App
++
++```sh
++adb reboot fastboot                 # 走 fastbootd（is-userspace: yes）
++fastboot flash boot boot_ksu_debug.img
++fastboot reboot
++```
++
++App 需要用户自己装（官方 release，与内核版本号对齐）：
++
++* `dist/ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk`
++  （md5 `389006099b815dd588fbcd354a05fc2b`，来源
++  `https://github.com/ReSukiSU/ReSukiSU/releases/download/v4.2.0-rc2/`）
++* 装完打开 App：显示"工作中 / 已安装"即内核已被识别；之后授权 App 即可拿 root。
++
++### 8. 回滚 / 关掉 root
++
++* 刷回不含 KSU 的镜像即可：`dist/boot_final_release.img`（正式版，无 KSU）；
++* 或者把 config 里的 `CONFIG_KSU` 改成 `# CONFIG_KSU is not set` 重编（注意 KSU 关闭后
++  `KernelSU/kernel/Kbuild` 里的钩子检查不会执行，源码里的 4 处钩子留在那里也无副作用）；
++* KSU 只在内核里增加钩子，没有改 `avb`/`verity`/`vbmeta`，所以刷回原镜像就是完全恢复。
++
++## 十三、音频「用久了全哑」的根因：真机复现 + 机制（2026-09-19）
++
++### 1. 复现方法（不依赖「用很久」，随时可复现）
++
++刷当前调试镜像，清日志后连放 3 轮音乐（`com.eebbk.musicplayer`），内核与 HAL 日志同时抓：
++
++```
++# dmesg（内核）
++[ 924.188492] SM6150 ASM Loopback: ASoC: no backend DAIs enabled for SM6150 ASM Loopback
++# logcat（HAL，tag audio_hw_primary）
++D disable_snd_device: snd_device(2: speaker)
++E  snd_card_name =sm6150-wcd9375-snd-card
++D disable_snd_device: iv_feedback_count-- befor=2
++D aw_is_supported_feedback_on_device [Awinic] 2 ret=1
++D disable_snd_device: iv_feedback_count-- after=1
++E disable_snd_device: iv_feedback_count = 1, can't stop feedback!
++```
++
++### 2. 机制（已能解释全部现象）
++
++1. `vendor.audio.feature.spkr_prot.enable=true`（在 `/vendor/build.prop` 第 134 行显式打开），
++   HAL（`/vendor/lib64/hw/audio.primary.sm6150.so`）于是走扬声器保护流程：
++   `audio_route` 应用 `spkr-vi-record` 路径 → 设 `TERT_MI2S_RX_VI_FB_MUX=TERT_MI2S_TX`
++   （这个 mux 原厂内核里有，我们这棵树原本缺，已在前面的提交补回）→ 再打开一路 **capture**。
++2. 那路 capture 落在 FE `SM6150 ASM Loopback`（machine driver `techpack/audio/asoc/sm6150.c`，
++   `MSM_FRONTEND_DAI_MULTIMEDIA6`，`dynamic=1` + `dpcm_capture=1`）。DPCM 要求该方向至少挂一个后端 DAI，
++   而 vendor HAL 的 mixer 路径里**没有任何** “MultiMedia6 Mixer TERT_MI2S_TX” 这类 FE→BE 连接控制
++   （routing 表里这条路由是存在的，见 `msm-pcm-routing-v2.c` 第 23385 行），所以 `be_clients` 为空 →
++   `dpcm_fe_dai_prepare()` 直接 `-EINVAL` → 内核这句 `no backend DAIs enabled`。
++3. HAL 的 `iv_feedback_count` 因此永远回不到 0：每放一轮它就少减一次，
++   `disable_snd_device(speaker)` 判断计数非 0 就**拒绝关掉扬声器**，
++   于是扬声器路由一直卡在“已开”状态；再叠加 awinic 回采启动失败（`pcm start for TX failed`），
++   最终表现就是「用久了所有声音全哑」，重启复位后恢复。
++
++### 3. 两条可行修法（都还没在真机上收尾）
++
++| 修法 | 做法 | 状态 |
++|---|---|---|
++| ROM 侧关掉这个功能（推荐，简单） | `/vendor/build.prop` 里 `vendor.audio.feature.spkr_prot.enable=false` | 镜像已做好（`dist/vendor_slim.img`），但**刷入卡在第一屏**，已回滚，详见第十四节 |
++| 不刷分区 | 用 KSU 模块开机 bind-mount 一份改好的 build.prop 覆盖 `/vendor/build.prop` | 待做（需要 App 装好、启用模块） |
++| 内核侧（治本但深） | 让这路 capture 能成功：自动把 FE 挂到 BE（routing 里已有 `MultiMedia6 Mixer TERT_MI2S_TX` 路由），或把该 FE 的 capture 改成非 DPCM | 未做，需要评估对其它 MultiMedia6 用例的影响 |
++
++**重要**：`iv_feedback_count` 与 `spkr_prot` 都在闭源 HAL 里（`grep -rl iv_feedback /vendor/lib64` 只命中
++`audio.primary.sm6150.so`），内核侧改不了它的计数逻辑，只能让它走不通的那条路不再被走到。
++
++---
++
++## 十四、/vendor 瘦身 + 关 speaker protection：一次尝试与回滚（2026-09-19）
++
++完整记录见 `docs/vendor-mod-attempt.md`，结论：
++
++* `/vendor/dataapp` 里 26 个预装 APK 占 **2.2 GB**（`/vendor/app` 只有 12 MB 且都是高通系统服务，不能删）。
++* 原镜像带 `shared_blocks`（Android 去重特性）→ Linux 只能**只读**挂载，无法原地改；
++  改用「只读挂载取树 → 删文件/改属性 → `mke2fs -d` 重建」的做法（实测 `mke2fs -d` **保留 security.selinux**）。
++* 产出 `dist/vendor_slim.img`：662 MiB（原 2.8 GB），md5 `1c0b9bf691eaa790d2be43a613f3f6c9`；
++  与工厂镜像逐文件对比：**除 26 个 APK 与 build.prop 一行外，权限/属主/SELinux 标签/内容差异全为 0**。
++* 刷入后**卡在第一屏**（两种可能：① 改了 vendor 但没同步 `vbmeta` → dm-verity 校验失败；
++  ② 那次刷写被会话中断，分区只写了一半）。恢复手段：按键进 fastbootd →
++  `fastboot flash vendor E:\s6ke\vendor\vendor.img` → 重启，已恢复正常（脚本 `work/tools/restore_vendor.ps1`）。
++* **当前决定：vendor 先不动**。要再试的话，先在 fastbootd 里 `fastboot fetch` 回读比对 md5，
++  一致再重启；若是 verity 问题就先刷带 `--disable-verity --disable-verification` 的 `vbmeta`。
++
++---
++
++## 十五、Android 15/16 GSI 的 BPF 可行性评估（2026-09-19）
++
++完整评估见 `docs/bpf-gsi-feasibility.md`，要点：
++
++* AOSP `platform/packages/modules/Connectivity` 提交 **"NetBpfLoad: enforce kernel 5.4 for Android W"**
++  （Merged 2025-01-14，change 3285058）→ 内核 < 5.4 直接拒绝加载 BPF，表现为一屏重启（`bpfloader-failed`）。
++* 我们这棵树**帖子里列的 8 项 defconfig 依赖全都有**；缺的是 5.x 那一整套：
++  BTF、`RINGBUF`/`SK_STORAGE`/`QUEUE/STACK`/`STRUCT_OPS`、`bpf_link`、`BPF_JMP32`、
++  `BPF_PROG_TYPE_EXT/LSM`，以及 5.x 的 verifier（`bpf()` 目前只有 `MAP_CREATE`/`PROG_LOAD`/`PROG_TEST_RUN`）。
++* 量级参考（实测）：小米 sm8250 的 `backport-5.10-bpf` 相对其 A15 分支 **+1444 提交**；
++  MTK 天玑 1200（**同是 4.14**）的 `android_kernel_aresin` A16 分支已含 `btf.c`、`local_storage.c` 等。
++* 建议：**先用 A13/A14 GSI 验证非 BPF 门槛**（vendor API level / VNDK / OEM HAL），再决定是否开工 BPF 大移植。
++
++## 十六、容器支持（Droidspaces v6.5.0 需求）：PID/IPC namespace + devtmpfs + user namespace（2026-09-19）
++
++### 1. 问题
++
++Droidspaces v6.5.0 的运行要求自检报出 4 项缺失：
++
++```
++[MUST]      [✗] PID namespace      Process ID namespace isolation
++[MUST]      [✗] IPC namespace      Inter-process communication isolation
++[RECOMMEND] [✗] devtmpfs support   Required for hardware access mode
++[OPTIONAL]  [✗] User namespace     CONFIG_USER_NS (--allow-userns / Docker / bwrap)
++```
++
++本树原本：`CONFIG_NAMESPACES=y`、`UTS_NS=y`、`NET_NS=y`、`CGROUPS=y`、`MEMCG=y`、`SECCOMP=y` 都有，
++但 `PID_NS`、`USER_NS`、`DEVTMPFS` 被关，`SYSVIPC` 也关着 —— 而 `IPC_NS` 的 Kconfig 依赖是
++`depends on (SYSVIPC || POSIX_MQUEUE)`，所以 IPC namespace 是**连带**缺失的。
++
++### 2. 改动（两个 config 文件末尾追加同一块）
++
++```diff
+++CONFIG_NAMESPACES=y
+++CONFIG_UTS_NS=y
+++CONFIG_NET_NS=y
+++CONFIG_PID_NS=y
+++CONFIG_IPC_NS=y
+++CONFIG_USER_NS=y
+++CONFIG_SYSVIPC=y          # IPC_NS 的依赖
+++CONFIG_SYSVIPC_SYSCTL=y
+++CONFIG_POSIX_MQUEUE=y     # 容器里常用的 POSIX 消息队列
+++CONFIG_POSIX_MQUEUE_SYSCTL=y
+++CONFIG_DEVTMPFS=y
+++# CONFIG_DEVTMPFS_MOUNT is not set
++```
++
++**为什么 `DEVTMPFS_MOUNT` 故意不打开**：打开后内核会在挂载 rootfs 后自动把 devtmpfs 挂到 `/dev`，
++和 Android init 自己挂的 tmpfs `/dev` 冲突；`DEVTMPFS=y` 已经足够让容器里 `mount -t devtmpfs` 成功。
++
++### 3. 编译期验证
++
++先只编受影响的那些对象，确认没有报错（都过）：
++
++```
++kernel/nsproxy.o kernel/pid.o kernel/pid_namespace.o kernel/user_namespace.o kernel/utsname.o
++ipc/msg.o ipc/sem.o ipc/shm.o ipc/mqueue.o ipc/util.o ipc/namespace.o
++fs/namespace.o fs/proc/namespaces.o drivers/base/devtmpfs.o
++kernel/cgroup/cgroup.o kernel/cgroup/namespace.o
++```
++
++`olddefconfig` 后的解析结果：
++
++```
++CONFIG_SYSVIPC=y            CONFIG_SYSVIPC_SYSCTL=y
++CONFIG_POSIX_MQUEUE=y       CONFIG_POSIX_MQUEUE_SYSCTL=y
++CONFIG_NAMESPACES=y         CONFIG_UTS_NS=y    CONFIG_NET_NS=y
++CONFIG_PID_NS=y             CONFIG_IPC_NS=y    CONFIG_USER_NS=y
++CONFIG_DEVTMPFS=y           # CONFIG_DEVTMPFS_MOUNT is not set
++CONFIG_CGROUPS=y            CONFIG_MEMCG=y     CONFIG_SECCOMP=y
++```
++
++### 4. 真机验证方式（不依赖 App）
++
++* `ls /proc/self/ns/` 应出现 `cgroup ipc mnt net pid pid_for_children user uts`（改之前只有 cgroup/mnt/net/uts）；
++* `cat /proc/filesystems | grep devtmpfs` 应列出 devtmpfs；
++* `cat /proc/sys/kernel/sem`、`cat /proc/sys/kernel/shmmax` 有值（SysV IPC 生效），
++  `ls /proc/sys/fs/mqueue` 非空（POSIX mqueue 生效）。
++
++> 说明：Droidspaces 的 root 一项本来就是 ✓（说明 ReSukiSU 的 root 已经在真机上跑通了）。
++
++### 5. 两份镜像与实测结果（2026-09-19）
++
++| 镜像 | 配置差异 | 实测 |
++|---|---|---|
++| `dist/boot_container_debug.img`（18817404 B，md5 `111bdb921de68f6197945e52bdb28cf9`） | `BBK_DEBUG_BRINGUP=y`（SELinux Permissive + `/proc/eebbk_kmsg`）、`KSU_DEBUG=y`（`allow_shell=true`） | 全项 ✓，`adb shell su -c id` → `uid=0 context=u:r:ksu:s0` |
++| `dist/boot_container_release.img`（18817404 B，md5 `38f947ce2a1684d2fd23051304fd8aa1`） | 两者都关：**SELinux Enforcing**、无调试节点、`allow_shell=false` | 全项 ✓，见下 |
++
++release 版实测（`su -c` 下执行，即容器会走的上下文）：
++
++```
++/proc/self/ns/        cgroup ipc mnt net pid pid_for_children user uts
++/proc/sys/kernel/sem  → 32000 1024000000 500 32000        （SysV IPC 生效）
++/proc/sys/kernel/shmmax → 18446744073692774399
++/proc/sys/fs/mqueue   → msg_default msg_max msgsize_default msgsize_max queues_max
++mount -t devtmpfs devtmpfs /data/local/tmp/dt → MOUNT_UMOUNT_OK（能看到 adsprpc-smd 等设备节点）
++unshare -p -f -i -u -m id → uid=0(root) context=u:r:ksu:s0   （PID/IPC/UTS/MNT namespace 可建）
++lsmod wlan=1；霍尔 bbk_hall_data 可读；KernelSU: driver version 35144, Work mode: Built-in
++```
++
++**注意（Enforcing 的副作用，不是故障）**：release 版下 `adb shell` 自身被 ROM 策略限制，
++`dmesg`、`/proc/sys/kernel/sem`、部分厂商属性/`sysfs` 会读不到（`klogctl: Permission denied`）；
++要读就用 `adb shell su -c '...'`（root 上下文）。调试版因为 Permissive 所以 shell 直接可读。
+diff --git a/EEBBK_S6_progress.md b/EEBBK_S6_progress.md
+new file mode 100755
+index 000000000..6e57ed090
+--- /dev/null
++++ b/EEBBK_S6_progress.md
+@@ -0,0 +1,530 @@
++# EEBBK S6 (P20H130 / sm6150 / sdmmagpiep) 进度总览
++
++日期：2026-09-12
++仓库：https://github.com/Zhiyu722/android_kernel_eebbk_sm6150 （master = `3f35bcd90`）
++
++## 状态总表
++
++| # | 项目 | 源码 | 编译 | 真机验证 |
++|---|---|---|---|---|
++| 1 | 无声 | ✅ 已修（两处根因） | ✅ | ✅ **实测有声音** |
++| 2 | 后置相机失效 | ✅ 已修 | ✅ | ✅ 后摄枚举 + 两个 proc 节点都在 |
++| 3 | 卡开机动画 | ✅ 已修（ADSP loader） | ✅ | ✅ `boot_completed=1` |
++| 4 | 厂商模块装载不上 | ✅ 已修（CRC 放行） | ✅ | ✅ `lsmod` 1 → 35 |
++| 5 | 触摸锁屏卡顿 + 乱上报 | ✅ 已修 | ✅ | ❌ 未刷机验证 |
++| 6 | 随机重启 / 15 分钟重启 | ✅ 已关闭全部厂商 panic 开关 | ✅ | ❌ 未刷机验证 |
++| 7 | 霍尔传感器（IST8801 / MXM1120） | ✅ 两个驱动已写 | ✅ | ❌ 未刷机验证 |
++| 8 | 升降前摄电机（vib_pwm） | ✅ 驱动已写 | ✅ | ❌ 未刷机验证 |
++| 9 | BBK 霍尔框架（bbk_hall_core） | ⛔ **规格已逆向，驱动未写** | — | — |
++| 10 | 前摄 sensor 驱动 | ⛔ 原厂私有，源码缺失 | — | 目前只枚举出后摄 |
++| 11 | 临时 root 路线 | ⛔ 未开始 | — | — |
++| 12 | BPF 加固 | ⛔ 按用户要求暂停 | — | — |
++
++---
++
++## 一、构建基线与打包
++
++- 工具链：WSL Ubuntu-22.04 + `/usr/bin/clang-11`（11.1.0）+ `LD=ld.lld`
++  （GNU ld 2.38 会错置 `.bss.rtic`，必须用 lld）
++- 命令：`make -j8 O=out_native CC=/usr/bin/clang-11 LD=ld.lld TECHPACK=y DTC=dtc Image.gz`
++- 配置：`arch/arm64/configs/h130_factory.config`（从原厂 boot.img 的 IKCONFIG 提取，
++  160 KB），直接 `cp` 成 `out_native/.config` 后 `olddefconfig`
++- 打包：`work/tools/mkboot2.py`，保留**原厂 ramdisk 与原厂 dtb/dtbo**，逐字节校验
++  （输出 `RESULT: ALL CHECKS PASSED`）
++- vermagic 必须是 `4.14.190-perf`，靠提交一个空的 `.scmversion` 固定
++
++---
++
++## 二、声音（真机验证通过）
++
++### 根因一：`TECHPACK=n` 把 ADSP loader 挡在内核之外
++
++`techpack/Kbuild` 读 `obj-${TECHPACK}`，传 `TECHPACK=n` 时只编译 `techpack/stub/`
++（1 个空对象），内核里**没有 `techpack/audio/dsp/adsp-loader.c`**：
++
++```
++TECHPACK=n → 无 adsp-loader.c → qcom,adsp-loader 节点无人绑定
++          → subsystem_get("adsp") 从不调用 → ADSP 不启动
++          → /dev/fastrpc-* 返回 ENOTCONN → adsprpcd 死循环
++          → 音频 HAL open_snd_mixer 无限重试 → audioserver 发不出 media.audio_policy
++          → SystemServer 一直等 → 卡开机动画
++```
++
++符号计数对比（`grep -a -c` 于 Image.gz 解压后的 Image）：
++
++```
++旧构建 TECHPACK=n ：aw882xx 0  wcd937x 0  bolero 0  adsp-loader 0  q6afe 0
++新构建 TECHPACK=y ：aw882xx 27 wcd937x 30 bolero 19 adsp-loader 2  q6afe 8
++```
++
++改动：`build_eebbk_clang11.sh` 默认改成 `TECHPACK=y`，并加编译后自检（符号计数）。
++提交 `c75936266`。
++
++### 根因二：机驱动硬编码 TFA98xx，本机是 AW882xx
++
++`techpack/audio/asoc/sm6150.c` 的 `populate_snd_card_dailinks()`：
++
++```c
++-   msm_mi2s_be_dai_links[0].codec_name     = "tfa98xx.2-0034";
++-   msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
++-   msm_mi2s_be_dai_links[1].codec_name     = "tfa98xx.2-0036";
++-   msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
+++   /* 本机 i2c 2-0034 / 2-0036 是 AWINIC AW882xx，不是 TFA98xx */
+++   dev_info(dev, "%s: dual AW882xx speakers configured (2-0034 & 2-0036)\n", __func__);
++```
++
++原因：`snd_soc_init_multicodec()` 只要 legacy 单 codec 字段非 NULL 就把 link 塌成
++单 codec 并覆盖 `codecs[0]`，于是上面选好的 `awinic_codecs[]` 被丢掉，link 指向本机
++不存在的 DAI：`ASoC: CODEC DAI tfa98xx-aif-2-34 not registered` →
++`snd_soc_register_card()` 永远 `-EPROBE_DEFER` → 没有声卡 → HAL 在
++`get_sndcard_id()` 崩。原厂 `machine_dlkm.ko` 里没有这些字符串、只有
++`aw882xx_dails`（48 B = 2×24 B `snd_soc_dai_link_component`），反证成立。
++提交 `a8b099b56`。
++
++### 真机实测（`boot_audio2.img`，md5 `5066C1A5FE896A91EA387D11DDF00DA3`）
++
++| 检查项 | 结果 |
++|---|---|
++| `/sys/class/sound/card0` | 有 ✅ 23 个 `pcmC0D*p` + 12 个 `comprC0D*` |
++| HAL 日志 | `snd_card_name: sm6150-wcd9375-snd-card`、`Opened sound card:0` |
++| 路由 | `AudioFlinger: AudioOut_D → 0x2 (AUDIO_DEVICE_OUT_SPEAKER)` |
++| `adsprpcd` | 不再报错，3 进程稳定 |
++| `sys.boot_completed` / `bootanim` | `1` / `stopped` ✅ |
++
++---
++
++## 三、后置相机（真机验证通过）
++
++原厂通过 `/proc/driver/BackCamera_info` 与 `/proc/driver/FrontCamera_info` 向相机服务
++暴露模组信息（EEPROM 映射 + 模组 ID），**这段补丁在源码树里不存在**，所以相机服务
++拿不到信息、后摄失效。
++
++改动：`drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_dev.c`
++（+562 行，3 个 hunk）：
++
++```c
++#define BBK_BACK_INFO_PROC    "driver/BackCamera_info"
++#define BBK_FRONT_INFO_PROC   "driver/FrontCamera_info"
++
++static void bbk_camera_info_suffix(char *suffix, size_t size, ...);   /* "(<module id>)" */
++static void bbk_camera_info_dump(struct seq_file *m, uint8_t *buf, ...);
++static int  back_camera_info_show(struct seq_file *m, void *v);
++static int  front_camera_info_show(struct seq_file *m, void *v);
++static int  back_camera_info_create_proc(void);     /* proc_create(...) */
++static int  front_camera_info_create_proc(void);
++static void bbk_camera_info_setup(struct cam_eeprom_ctrl_t *e_ctrl);
++static void bbk_camera_info_read_module_id(struct cam_eeprom_ctrl_t *e_ctrl);
++```
++
++`bbk_camera_info_setup()` 在 EEPROM 初始化路径里被调用两次（挂接 + probe），
++`bbk_camera_info_read_module_id()` 读模组 ID 并缓存。
++
++验证：`/proc/driver/BackCamera_info`、`/proc/driver/FrontCamera_info` **真机都在**；
++`dumpsys media.camera` 从 0 恢复为 **1（后摄枚举）**。
++
++⚠️ **前摄 sensor 本身仍未枚举**：前摄 sensor 驱动是原厂私有、源码缺失。
++「升降机构能控制」与「前摄能出图」是两件不同的事。
++
++---
++
++## 四、三个"不修就起不来/装不上"的基础修复
++
++### 1. `.bss.rtic` 被放到 `_end` 之后（`fe25b9de1`）
++
++BBK 的 `__rticdata`（`RTIC_BSS`，含 `selinux_state`）原本被放在 `_end` 之后的
++`STABS_DEBUG`（显式地址 0）之后 → 位置计数器被复位 → ADRP 溢出，且该段落在内核
++保留区间 `_text.._end` **之外**，会被页分配器当空闲内存发出去 → `selinux_state`
++被覆盖 → 卡第一屏。
++
++```ld
++ 	BSS_SECTION(0, 0, 0)
++ 
+++	.bss.rtic : {			/* RTIC bss segment	*/
+++		RTIC_BSS
+++	}
+++
++ 	. = ALIGN(PAGE_SIZE);
++ 	idmap_pg_dir = .;
++ 	...
++ 	_end = .;
++-	.bss.rtic : { RTIC_BSS }      /* 原位置：STABS_DEBUG 之后 */
++ 	STABS_DEBUG
++```
++
++修复后：`0xffffff800a623000 < _end 0xffffff800a62b000`，`.bss.rtic` 在镜像内。
++
++### 2. vermagic（`6e67f03cb`）
++
++缺 `.scmversion` 时 release 变成 `4.14.190-perf-g<hash>-dirty`，厂商模块 vermagic
++不匹配全部拒绝加载。提交一个空的 `.scmversion`（`.gitignore` 加 `!.scmversion`）。
++
++### 3. 厂商模块符号 CRC（`fb705bbaa`）
++
++厂商 `/vendor/lib/modules/*.ko` 是与出货内核一起编的，本树算出的 CRC 不同
++（`module_layout`：厂商 `0xcc8cac52` vs 本树 `0x021f9ae4`）。`modversions` 是 vermagic
++的一部分不能关，于是放行校验：
++
++```c
++ bad_version:
++-	pr_warn("%s: disagrees about version of symbol %s\n", info->name, symname);
++-	return 0;
+++	pr_warn("%s: disagrees about version of symbol %s (accepted for vendor modules)\n",
+++	       info->name, symname);
+++	return 1;
++```
++
++配合 `CONFIG_MODULE_SIG_FORCE=n`。效果：**`lsmod` 从 1 变 35**，相机/音频厂商模块
++才装得上，音频 HAL 不再崩。
++
++---
++
++## 五、触摸：锁屏后卡顿 + 乱上报（已修，未真机验证）
++
++### 根因
++
++`focaltech_core.c` 用 `#if defined(CONFIG_FB) ... #elif defined(CONFIG_DRM) ...`
++选息屏通知器。本内核 **`CONFIG_FB=y` 且 `CONFIG_DRM=y`**，而显示是 MSM DRM(SDE)：
++
++- 走了 `CONFIG_FB` 分支 → 注册遗留 `fb_notifier`
++- MSM DRM 只调 `msm_drm_notifier_call_chain()`（`msm_atomic.c:266/287`）→ **FB blank
++  事件永远不来**
++- `fts_ts_suspend()/fts_ts_resume()` 唯一调用者就是那两个回调 → **从不被调用**
++- 该 i2c 驱动也没有 `dev_pm_ops`（`FTS_PATCH_COMERR_PM == 0`）
++
++结果：息屏后触摸控制器保持唤醒、IRQ 一直开着，线程化 handler 连续做 i2c 读
++（CPU 被反复唤醒 = **锁屏后很卡**），读到什么就上报什么（= **触摸乱上报**）。
++
++### 改动（`1eaa23fa9`，`focaltech_core.c` +64/−30）
++
++```c
++-#if defined(CONFIG_FB)
+++#if defined(CONFIG_FB_MSM)              /* 只有传统 MSM framebuffer 才走 fb 路 */
++ #include <linux/notifier.h>
++ #include <linux/fb.h>
++-#elif defined(CONFIG_DRM)
++-#if defined(CONFIG_DRM_PANEL)
++-#include <drm/drm_panel.h>
++-#else
+++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
+++#include <linux/notifier.h>
++ #include <linux/msm_drm_notify.h>
++-#endif
++```
++
++以及 probe 里改成注册 MSM DRM client：
++
++```c
++-#if defined(CONFIG_FB)
+++#if defined(CONFIG_FB_MSM)
++     ts_data->fb_notif.notifier_call = fb_notifier_callback;
++     ret = fb_register_client(&ts_data->fb_notif);
++-#elif defined(CONFIG_DRM)
+++#elif defined(CONFIG_DRM) || defined(CONFIG_MSM_DRM)
++     ts_data->fb_notif.notifier_call = drm_notifier_callback;
++```
++
++同树参照：`st/fts.c`（只在 `CONFIG_FB_MSM` 时走 fb 路）、
++`hxchipset/himax_common.c`（`CONFIG_DRM` 下 `msm_drm_register_client`）。
++另修好了头文件包含（`linux/msm_drm_notify.h` 原先只在死掉的 `CONFIG_DRM_PANEL`
++分支里可达）与 DRM 事件变体（`MSM_DRM_EVENT`）。
++
++**状态**：编译通过、离线核对通过；`boot_touchfix.img` **尚未刷机验证**。
++
++---
++
++## 六、随机重启 / 「15 分钟就重启」
++
++排查结论：**不是 BBK 看门狗**。
++
++- 全树只有标准高通 `CONFIG_QCOM_WATCHDOG_V2=y`（`drivers/soc/qcom/watchdog_v2.c`），
++  没有 BBK 自研看门狗；`user_pet_enabled` 默认关，BBK ROM 也从不写它
++  （5 个 super 镜像里 0 命中）
++- DTB `qcom,wdt@17c10000`：bark 11000 ms / pet 9360 ms，属正常
++- 真正原因是厂商的"调试即 panic/重启"开关，已全部关闭（`adf179dad`）：
++
++```
++# CONFIG_SETUP_SSR_NOTIF_TIMEOUTS is not set
++# CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT is not set
++# CONFIG_QCOM_FORCE_WDOG_BITE_ON_PANIC is not set
++# CONFIG_EDAC_KRYO_ARM64_PANIC_ON_UE is not set
++CONFIG_PANIC_TIMEOUT=0
++```
++
++`SSR_SUBSYS_NOTIF_TIMEOUT` 保持 20000；`subsystem_restart.c` 的
++`panic("Subsystems have crashed %d times...")` 受 `max_restarts` 控制（默认 0 关闭）。
++
++---
++
++## 七、霍尔传感器与升降前摄（工作量最大的一项）
++
++### 问题：4 个 BBK 私有驱动在源码树里完全不存在
++
++```
++CONFIG_INPUT_HALL=y            ← bbk_hall_core 框架
++CONFIG_INPUT_MXM1120_UP/_DOWN  ← 升降端点霍尔（Magnachip MXM1120）
++CONFIG_INPUT_IST8801=y         ← 3D 霍尔开关（iSentek IST8801）
++CONFIG_VIB_PWM=y               ← 升降电机（原厂文件名 gpio_pwm.c，模块名 gpio_pwm）
++```
++
++它们是**编进内核**的（非模块），所以 `/vendor/lib/modules` 里也拿不到。
++
++### 逆向方法（可复现）
++
++1. `pip3 install peewee`；用 vmlinux-to-elf 把原厂 `Image` 还原成带符号 ELF
++   （kallsyms 完整保留，37 MB / 115367 符号）
++2. `nm` 取地址 → `objdump -d --start-address/--stop-address` 逐函数反汇编
++3. 字符串常量：`adrp xN,PAGE` + `add xN,xN,#OFF` → 地址 → `objdump -s` 读 ASCII 列
++4. `.data` 里的结构体（`device_attribute{name,mode,show,store}`、
++   `file_operations`）直接 dump 解码 → 直接跳到处理函数
++
++### 交付的三个驱动
++
++| 驱动 | 文件 | 关键内容 | 提交 |
++|---|---|---|---|
++| IST8801 | `drivers/input/misc/ist8801.c` | i2c 读写协议、寄存器映射（`0x01/0x07/0x08` 工作模式、`0x09` DID、`0x10` 五字节数据块、`0x40/0x54` 状态）、`data/enable/delay/vendor` sysfs | `4133ef332` + `9eb72677a` |
++| MXM1120 | `drivers/input/misc/mxm1120.c` | ID 校验 `0x9c`、逐条照抄的 probe 时序、测量解码（10bit `buf[1]\|((extra>>6)<<8)` / 8bit `buf[2]&0x7f` 符号扩展）、input 设备 `m1120_up/down` + `ABS_X ±32767`、4 个原厂 DT 属性 | `d29eb7b37` |
++| 升降电机 | `drivers/misc/bbk_vib_pwm.c` | 5 个 GPIO、`gcc_gp2_clk`、15 个 sysfs 属性、camera_state 状态机、`h110-vib-input` 键注入、8 个模块参数 | `4a463d27f` + `861f832a9` |
++
++### 关键逆向发现
++
++1. **升降电机不是 PWM**：DT 里没有 pwm phandle，驱动波形就是 `gcc_gp2_clk`
++   （`clocks=<&gcc 36>`、`clock-names="gp2_clk"`），由 `vib_pwm_active` 这个
++   pinctrl 状态把 **GPIO21 复用成 `gcc_gp2`** 输出；`clk_set_rate` 直接决定斩波频率
++   （实际用到 19200 / 32000 / 41600 / 4800 Hz 四档）。
++   上电：`dir → boost=1 → msleep(3) → enable=0 → sleep=1 → msleep(3) → clk_enable`；
++   断电：`boost=0 → msleep(5) → enable=1 → sleep=0`（停止不动 dir）。
++2. **GPIO 极性与别名**：boost 驱动 1/空闲 0；enable **低有效**（驱动 0/停 1）；
++   sleep 驱动 1/停 0；**dir 0=上行、1=下行**；id 输入（GPIO25 上拉读机型）。
++3. **行程时间表**：`all_time`（模块参数 `mhall_control7`，默认 **2839**）为满行程；
++   69.6% 位 = `all_time*696/1000`；主驱动段统一乘 **6/10**（19200 标称 → 32000 实际）；
++   `time>65536` 时先 50 ms 预驱动段，再 41600 Hz 跑 `(time-50)*6/13`。
++4. **`camera_state` 不止 0/1/2**：`4`=上行中、`5`=下行中（忙态，判断
++   `(state & ~1) == 4`，所以收尾**必须**把 `camera_state` 写成 target，否则永久拒绝
++   新命令）、`6`=防夹异常态、`7`=holder 保持位（介于 1 与 2 之间）。
++   你给的 **0 收回 / 1 升起 / 2 升起并偏转** 对应 `0 / 69.6% 位 / 满行程位`。
++5. **`abort_notify` 是字符串关键字协议**（不是数字）：`"0x27c"/"636"`、
++   `"0x27d"/"637"`、`"0x27f"/"639"`、`"0x280"/"640"`、`"0x282"/"642"`、
++   `"0x283"/"643"`、`"0x284"/"644"`、`"666"`、`"888"`、`"stream on"`、
++   `"stream off"`、`"username:"`、`"com.eebbk.askhomework"`。
++6. **会注册 input 设备 `h110-vib-input`**（`h110-vib/input0`，bustype 0x19）并注入键
++   **635–646**（按下+SYN、抬起+SYN）——Android 侧靠它判断升降机构状态。
++7. **15 个 sysfs 属性**的名字/权限（仅 `vib_pwm_id` 是 0444）/打印格式、
++   `dir` 只看首字符是不是 `'1'`、`time` 写 1300 = `all_time+10` 等怪癖全部对齐。
++8. **`bbk_hall_core` 框架**（规格已逆向、驱动未写）：misc 设备 `/dev/bbk_hall_core`；
++   ioctl 仅 4 条 `0x40046000/1/2/3`（SET_CALI / TRANS_CALI / SET_MHALL_CALI /
++   SET_MHALL_CALI_DAEMON）；标定文件是**裸二进制无 magic**：
++   `cali_hall` 恰 **56 B**、`cali_mhall_final` 恰 **48 B**，
++   `up_down_count` 是 `"%u-%u"` 文本；6 个 sysfs 位于
++   `/sys/devices/platform/bbk_hall_core/`；平台设备名 `bbk_hall_core`（**无 compatible**），
++   设备在上下两路传感器都注册成功后才由框架自己注册；传感器通过
++   `struct hall_dev { char name[24]; ops*; void *data; }` 注册（名字前 2/4 字节必须是
++   `up`/`down`）。
++9. **位置插值**：行程 0→3828(24%)→7656(48%)→11101(69.6%)→15950，五锚点分段线性插值。
++
++`bbk_vib_pwm.c` 对 `bbk_hall_core` 的调用是 **`__weak` 弱符号**，框架一写进去就自动
++接管（已用 `nm` 确认 `W bbk_hall_core_enable` 且是真实 `bl` 调用，未被内联）。
++
++---
++
++## 八、交付物
++
++### 镜像（`E:\s6ke\dist\`，均为「本仓库 clang-11 编译的 Image.gz + 原厂 ramdisk +
++原厂 dtb/dtbo」重打包，`RESULT: ALL CHECKS PASSED`）
++
++| 文件 | 说明 | MD5 |
++|---|---|---|
++| `boot_hall4.img` | **最新（全部修复 + 两个霍尔 + 升降电机）** | `5B69F9CBBA2FA62F8D49EC577B960ED4` |
++| `boot_audio2.img` | **已真机验证**：有声音、相机可用、开机完成 | `5066C1A5FE896A91EA387D11DDF00DA3` |
++| `boot_hall3.img` | 升降电机初版 | `231B41E67D6B58B2572AA6BF7EE492A2` |
++| `boot_hall2.img` | 加入 MXM1120 | `9DC37F3BF8A57D70E1162ED44749BFB6` |
++| `boot_hall1.img` | 加入 IST8801 + 关 panic 开关 | `883761A93AF7FB38BBBE4C81BA02A907` |
++| `boot_touchfix.img` | 触摸修复 | `C35B776CACDA25287E3A510C980EE637` |
++| `boot_nopanic.img` | 关 panic 开关 | `38AE7D4C5E66465176F51B2800AD14E0` |
++| `boot_native.img` / `boot_fixed.img` | 失败版本（无声/卡动画），仅留档 | — |
++
++### 补丁文件夹（仓库根目录）
++
++- `s6patch相机/` — 0001 相机 proc 节点、0002 `vmlinux.lds.S` 链接布局 + README + 构建脚本
++- `s6patch声音/` — 0001 module CRC、0002 工厂 config、0003 构建脚本、0004 AW882xx codec + README
++- `s6patch触摸/` — 0001 MSM DRM notifier + README
++- `s6patch霍尔/` — 0001–0007 补丁序列 + README + **两份逐指令级逆向报告**
++  （`vib_pwm-逆向报告.md` 1036 行、`bbk_hall_core-逆向报告.md` 406 行）
++
++> `.gitignore` 忽略 `*.patch`，故补丁用 `git add -f` 跟踪。
++
++### 文档
++
++- `EEBBK_S6_changes.md` — 相机/声音/触摸/看门狗全过程 + 真机证据链
++- `EEBBK_S6_progress.md` — 本文件
++- `E:\s6ke\dist\README.md` — 镜像清单 + 刷机/回滚/验证命令
++
++---
++
++## 九、刷机与验证（本机特有）
++
++**必须手动进 fastbootd**（`fastboot getvar is-userspace` 返回 `yes`）：
++
++```
++fastboot flash boot E:\s6ke\dist\boot_hall4.img
++```
++
++| 进入方式 | 序列号 | 能否刷 |
++|---|---|---|
++| 手动进 fastbootd | `2fa7c794` | ✅ |
++| `adb reboot fastboot` | `0123456789ABCDEF` | ❌ `Unrecognized command download` |
++| 再 `fastboot reboot bootloader` | `2fa7c794` | ❌ `unknown command`（ABL） |
++
++回滚随时可用：`fastboot flash boot E:\s6ke\imgdata\boot.img`
++
++> 不要刷本仓库编译出的 dtbo：BBK 的霍尔/升降节点只存在于原厂 dtbo 里。
++
++升降快速验证：
++
++```
++adb shell cat /sys/devices/platform/soc/soc:bbk_vib_pwm/vib_pwm_id
++adb shell 'echo 1 > /sys/devices/platform/soc/soc:bbk_vib_pwm/vib_pwm_camera_state'
++adb shell 'echo 0 > /sys/devices/platform/soc/soc:bbk_vib_pwm/vib_pwm_camera_state'
++adb shell dmesg | grep -i 'vib\|m1120\|bbk_hall'
++```
++
++---
++
++## 十、待办与风险
++
++1. **`bbk_hall_core` 驱动**（唯一还缺的驱动，规格已齐备）——影响 BBK 标定 daemon 与
++   `/sys/devices/platform/bbk_hall_core/*`。
++2. **真机验证**触摸 / 升降 / 霍尔（需手动进 fastbootd）。
++   行程标定值（2839 那套）只能靠实机微调，这是纯逆向无法确定的唯一部分。
++3. **前摄 sensor 驱动**：原厂私有、源码缺失；「升降能动」≠「前摄能出图」。
++4. **临时 root 路线**：计划 `boot_debug.img` = SELinux 强制 permissive +
++   `/proc/eebbk_kmsg`（0444，走 `do_syslog(SYSLOG_ACTION_READ_ALL)` 绕过权限检查）。
++   注：原厂 ramdisk 是 system-as-root 且**没有 `prop.default`**，走 ramdisk 的
++   `ro.debuggable` 路子不通。
++5. **BPF**：按用户要求暂停。现状 `kernel/bpf/verifier.c` 与上游 v4.14.190 逐字节一致，
++   `sysctl_unprivileged_bpf_disabled` 默认 0，`scalar32_min_max_or`/`s32_min_value`
++   缺失（CVE-2020-8835 类问题未修），`CONFIG_BPF_JIT_ALWAYS_ON=y`；
++   上游 4.14.y verifier 补丁已备好（`/root/bpfpatch/bpf_4.14y.patch`，670 行，可干净应用）。
++6. **QMMI**：ROM 的工厂测试 App（`BOOT_COMPLETED` 接收器，暗码 7664），
++   与内核改动无关，原厂内核同样自启。
++
++---
++
++## 十一、升降前摄打通（本轮，已真机验证）
++
++### 根因：GP 时钟表缺少低频挡位
++
++本机时钟控制器是 `compatible = "qcom,gcc-sdmmagpie"`（设备树 `qcom,gcc@100000`），
++而本仓库同时编入了三个 GCC 驱动（`SM6150`/`SDMMAGPIE`/`SM8150`，与原厂二进制里
++三份同名 `gcc_gp2_clk_src` 一一对应）。**真正生效的是 sdmmagpie 那份**。
++
++升降电机的斩波时钟是 `<&gcc GCC_GP2_CLK>` = `gcc_gp2_clk`（分支时钟），其父为
++`gcc_gp2_clk_src`（mnd RCG）。厂商驱动与本项目复刻都调用
++`clk_set_rate(branch, 32000)`，但**分频器在父 RCG 上**，而 `gcc-sdmmagpie.c` 里的
++`ftbl_gcc_gp1_clk_src` 只有 `19.2M / 25M / 50M / 100M / 200M` —— 32 kHz 无处落地。
++
++实测证据（`/proc/eebbk_pins` + `vib_pwm_debug`）：
++
++```
++gp2_clk rate=19200000  round(32000)=19200000  parent=gcc_gp2_clk_src parent_rate=19200000
++```
++
++即引脚始终输出 **19.2 MHz**，电机驱动芯片无法在此频率下开关 → 只有轻微声音、没有扭矩，
++机构不动。**原厂固件的这套升降逻辑同样是不工作的**（它请求的就是这些低频值）。
++
++### 修复：按原厂二进制还原频率表
++
++用脚本扫描原厂 `vmlinux`（`work/tools/gp_clk_table.py`、`gp_clk_who.py`、
++`gp_clk_full.py`）：以 `cmd_rcgr = 0x65004` 定位 RCG 结构，读 +16 处的 `freq_tbl` 指针，
++再经 `clkr.hw.init -> clk_init_data.name` 确认身份，得到 sdmmagpie 那份表：
++
++| 频率 | src | pre_div | m | n |
++|---|---|---|---|---|
++| 19200 | 0 (bi_tcxo) | 31 | 4 | 250 |
++| 32000 | 0 | 31 | 2 | 75 |
++| 41600 | 0 | 29 | 8 | 246 |
++| … | 0 | … | … | … |
++
++`F(f,s,h,m,n)` 写入结构体时 `pre_div = 2h-1`，而
++`clk_rcg2_calc_rate() = (父频/h) * m / n`：
++
++```
++19200000 / 16 * 2 / 75  = 32000    普通移动
++19200000 / 16 * 4 / 250 = 19200    远距离移动第一段
++19200000 / 15 * 8 / 246 = 41626    第二段
++```
++
++正是 `gpio_pwm.c` 请求的三个频率。补丁 0033 把整张表（4800…64000 + 原有高频项）
++逐条写回 `gcc-sdmmagpie.c`；补丁 0034 另外把频率设到父 RCG 上并修掉
++`clk_core_disable` 的引用计数 WARNING。
++
++### 验证结果
++
++```
++vib_pwm_set_clock: freq 32000, gcc_gp2_clk_src -> 32000 Hz, branch 32000 Hz
++up 0: ... gp2_clk rate=32000 ... enabled=1 parent_rate=32000 boost=1 en=0 sleep=1 dir=0
++```
++
++- 引脚电平序列（boost=1 / enable=0 / sleep=1 / dir=0 上升、dir=1 下降）与工厂逐指令一致
++- `pinctrl active/suspend` 选择成功，移动时长按 6/10 脉冲数换算
++- **用户实测：前摄能正常升起，无异响、无卡住** ✅
++
++### 附带修正
++
++- **霍尔解码（0035）**：芯片 ID 在寄存器 `0x09`（值 `0x9c`）；测量值高位取自 `0x10` 块
++  第三字节并做 10 位补码符号扩展，无 DRDY 时返回 `-1`（`data` 显示 `-2000`）。
++  此前误从 `0x00` 读高位，导致读数恒为 256。
++- **调试能力（0036）**：`/proc/eebbk_kmsg` 支持写关键字过滤与 `clear`；
++  `/proc/eebbk_pins` 输出 21/23/24/25/26/29 号引脚电平方向与 `gcc_gp2_clk` 频率。
++  这两个节点是定位本轮问题的主要手段，仅存在于 bring-up 构建。
++
++### 仍未解决
++
++1. **霍尔不产生测量值**：`0x10` 数据块恒为 0（芯片能应答 ID，但未进入转换），
++   `bbk_hall_data` 上报 `up:-2000 down:-2000`。升降的移动是开环定时，不依赖霍尔。
++2. **触摸 DRM 通知修复**未真机实测。
++3. **WiFi 打不开**（`Failed to load WiFi driver` / `Wifi HAL start failed`），按用户要求暂缓。
++
++### 交付
++
++| 文件 | 说明 | md5 |
++|---|---|---|
++| `dist/boot_release.img` | 正式版：全部修复，关闭 bring-up 调试 | `df22126716c7b7831fb91f41fa330a53` |
++| `dist/boot_cam11.img` | 调试版（#30），升降即在此版验证 | `92bf1cf3c19978ebd36dad06c5792d17` |
++| `patch+++/` | 全部补丁合并整理（含 README 索引） | — |
++
++---
++
++## 2026-09-19：通知声 / 锁屏提示音 / 升降下降凸起
++
++### 通知声
++- 实测轨道增益：故障时 `AF::Track: setFinalVolume:0.063096`（-24 dB），
++  因为扬声器的铃声/通知音量只有 3/15；媒体走 offload 通路所以不受影响。
++- 修复：`volume_ring_speaker` 提到 15 + 音量键 → 增益 0.39~1.0 → 默认短通知声
++  （pixiedust）每次都能听到（用户确认）。
++- 另一个状态问题：HAL 的 awinic VI feedback 启动失败（`pcm start for TX failed`）
++  → `iv_feedback_count` 泄漏 → `disable_snd_device(speaker)` 提前退出 → 扬声器路由卡死
++  → 所有声音全哑，**重启恢复**（用户确认）。
++
++### 锁屏提示音
++- `framework-res.apk` 的 `resources.arsc` 里 raw 类型只有 6 个条目，没有 lock/unlock；
++  锁屏音改从设置项取路径。写入 `global lock_sound` / `global unlock_sound` 指向
++  `/product/media/audio/ui/Lock.ogg` / `Unlock.ogg`，锁屏与解锁各产生一次 SoundPool 播放
++  （`0.126` / `0.309`）。
++
++### 升降下降凸起
++- `vib_pwm_move_to: want 0, current 1 -> down for 1941 ms`（与上升同长），
++  而原厂靠霍尔 `add_time` 重试补下降行程；本机霍尔 standby → 闭环失效 → 凸起。
++- 用 `/dev/bbk_hall_core` 的 `SET_CALI`(0x40046000) / `TRANS_CALI`(0x40046001)
++  把 `cali_time` 2790 → 3630（+30%），驱动时长 1941 → 2526 ms，
++  相机 App 实测降到底贴合、无凸起（用户确认）。
++- 工具：`patch+++/tools/elev.c`（静态 aarch64，已推到 `/data/local/tmp/elev`）。
++  回退：`elev set 2790`。
++
++### 内核重编卡开机（未查明）
++- 两次重编（增量 / 全新）都卡在开机画面，对照刷回 `boot_elev_dbg.img` 立即正常。
++- 已排除：config（内嵌逐行相同）、clang/LLD 版本、模块符号 CRC、源码差异（仅三处良性改动）。
++- 结论：升降补偿走校准方案，未验证的内核改动以 patch 形式保留、未合入。
++
++### 霍尔（下一步）
++- `bbk_hall_data = up:-2000 down:-2000`（无 DRDY），芯片 0035、ID 寄存器 0x09=0x9c、
++  数据块 0x10 的解码此前已逆向；驱动 `mxm1120` 目前刻意留在 standby。
+diff --git a/README.md b/README.md
+new file mode 100755
+index 000000000..6145a5d21
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,126 @@
++# EEBBK S6（P20H130 / sm6150 / sdmmagpiep）内核源码 —— 最终版
++
++| 项 | 值 |
++|---|---|
++| 设备 | EEBBK S6 学习平板（adb `7013T3603C41X`，fastboot `2fa7c794`，已解锁） |
++| 内核基线 | `4.14.190-perf`，QCOM **msm-4.14**（CAF），`sdmmagpiep` |
++| 工具链 | clang **11.1.0-6** + **lld 11.1.0**（不用 GNU ld：2.38 会把 `.bss.rtic` 放错位置） |
++| 仓库 | https://github.com/Zhiyu722/android_kernel_eebbk_sm6150 （`master`） |
++| 本版提交 | `b3d8129fa`（=`git log -1`） |
++
++---
++
++## 一、构建（**必须用仓库自带脚本**）
++
++```sh
++# 正式版（SELinux Enforcing，日常用）
++OUT=out_release CONFIG=h130_release.config TECHPACK_MODE=y ./build_eebbk_clang11.sh
++# 调试版（SELinux Permissive + /proc/eebbk_kmsg + KSU allow_shell）
++OUT=out_debug   CONFIG=h130_debug.config   TECHPACK_MODE=y ./build_eebbk_clang11.sh
++
++# 打包成可刷的 boot 镜像（把 wlan.ko 放进 ramdisk —— WiFi 依赖它）
++python3 <mkboot3.py> out_release/arch/arm64/boot/Image.gz boot.img <wlan.ko>
++```
++
++脚本做四件事：删掉 out 目录 → 用 `arch/arm64/configs/` 里的配置 → 跑两遍 `olddefconfig`
++（中间关掉 `CONFIG_MODULE_SIG_FORCE`）→ 先构建 `security/selinux/ init/`（KernelSU 需要的
++`flask.h`/`compile.h` 是这两处生成的）→ 编 `Image.gz`。
++
++> **不要手写 `make` 复用旧 out 目录**：本机实测这样编出来的内核**不能开机**（历史教训）。
++> `TECHPACK_MODE` 必须保持 `y`：`TECHPACK=n` 会把 ADSP loader 挡在内核之外 → 完全没声音。
++
++### 配置差异
++
++| 配置 | 用途 | 与 release 的差异 |
++|---|---|---|
++| `h130_factory.config` | 原厂基线（分析用） | — |
++| `h130_debug.config` | 调试版 | `CONFIG_BBK_DEBUG_BRINGUP=y`（Permissive + 调试节点）、`CONFIG_KSU_DEBUG=y`（`allow_shell=true`） |
++| `h130_release.config` | **正式版** | 上面两项都关 → SELinux Enforcing、`allow_shell=false` |
++
++两份 config 都带：`CONFIG_KSU=y` + `CONFIG_KSU_MANUAL_HOOK=y`（含 4.14 的六个手动钩子）、
++容器支持（`PID_NS`/`IPC_NS`/`USER_NS`/`DEVTMPFS`/`SYSVIPC`/`POSIX_MQUEUE`）。
++
++---
++
++## 二、要不要重编的对照表（这份源码修了什么）
++
++| # | 子系统 | 问题 → 修法 | 详情 |
++|---|---|---|---|
++| 1-6 | 音频 | 完全无声/机驱动/功放/寄存器表/32bit/路由 → techpack 音频栈编进内核 + awinic 改造 | `EEBBK_S6_changes.md` 一~七 |
++| 7 | 相机 | 后摄失效、缺 proc 节点 → `cam_eeprom_dev.c` 内存映射 + `/proc/driver/*Camera_info` | 同上 |
++| 8 | 触摸 | 锁屏后卡顿乱报点 → FTS 驱动改用 DRM panel notifier | 同上 |
++| 9-11 | 升降 | 完全不动/频率写不进/卡死 → 新增 `drivers/misc/gpio_pwm.c`（逆向）+ 时钟表 + 时序自修复 | 同上 |
++| 12-15 | 霍尔 | 无数据/恒 -2000/无 DRDY/「卡一半」→ 新增 `bbk_hall_core.c` + `mxm1120.c` + 卡住判据 | 第十、十一节 |
++| 16 | WiFi | 厂商 `wlan.ko` ABI 不兼容 → 自带 qcacld 编成 `wlan.ko` 放 ramdisk | 第七节 |
++| 17-19 | 构建/调试/标识 | 模块签名与 CRC、`.bss.rtic`、vermagic、调试设施、版本串 | 第七节 |
++| 20-21 | **root** | 内置 ReSukiSU（KernelSU 非 GKI 分支）+ 4 个文件六个手动钩子 | 第十二节、`KernelSU/VENDORED.md` |
++| 22 | **容器** | Droidspaces 需要的 PID/IPC namespace + devtmpfs + user ns | 第十六节 |
++
++---
++
++## 三、目录里有什么（我们自己加的东西）
++
++```
++build_eebbk_clang11.sh            构建脚本（唯一入口）
++arch/arm64/configs/h130*.config   四份配置（factory / debug / release / h130）
++KernelSU/                         内置的 ReSukiSU 源码（见 KernelSU/VENDORED.md）
++drivers/kernelsu -> ../KernelSU/kernel  （symlink，upstream 的接法）
++drivers/input/hall/bbk_hall_core.c      霍尔框架（逆向重写）
++drivers/input/misc/mxm1120.c            磁传感器驱动（新写）
++drivers/misc/gpio_pwm.c                 升降电机驱动（逆向重写）
++drivers/misc/bbk_debug.c                /proc/eebbk_kmsg、/proc/eebbk_pins
++EEBBK_S6_changes.md                技术总账（**16 节**，改了什么/为什么/怎么验证）
++EEBBK_S6_progress.md               过程记录
++docs/vendor-mod-attempt.md         /vendor 瘦身尝试与回滚（未采用）
++docs/bpf-gsi-feasibility.md        Android 15/16 GSI 的 BPF 可行性评估
++tools/ksu/*.py                     KernelSU 集成的锚定脚本（钩子注入 / Kconfig 适配）
++patch+++                           按主题拆分的补丁包 + 中文 README
++```
++
++---
++
++## 四、镜像（`dist/`，md5 用 `certutil -hashfile <img> MD5` 复核）
++
++| 文件 | 说明 | md5 |
++|---|---|---|
++| `boot_container_release.img` | **正式版（推荐日常）**：全部修复 + KSU + 容器，SELinux Enforcing | `38f947ce2a1684d2fd23051304fd8aa1` |
++| `boot_container_debug.img` | 调试版：同上但 Permissive、`allow_shell=true`、调试节点 | `111bdb921de68f6197945e52bdb28cf9` |
++| `boot_ksu_release.img` / `boot_ksu_debug.img` | 上一代（无容器支持） | `f362a2698cdcb616c51da048c293e377` / `4e99cd80950d99c0afaa45401d884c66` |
++| `boot_final_release.img` | 无 KSU 的正式版（想完全不要 root 时用） | `cbc7f63e6545af384150bd386f3ae945` |
++| `boot_hall2.img` | 回滚兜底（霍尔修复、无 KSU） | `38fdcd311b9fff3c3d29de3de3a02d17` |
++| `vendor_slim.img` | 瘦身后的 /vendor（**未采用**，刷了会卡第一屏，见 docs） | `1c0b9bf691eaa790d2be43a613f3f6c9` |
++| `ReSukiSU_v4.2.0-rc2_35144-arm64-v8a-release.apk` | 配套的 root 管理器 App（内核版本号 35144 对得上） | `389006099b815dd588fbcd354a05fc2b` |
++
++历史实验镜像都在 `dist/history/` 里（98 个文件、约 1.7 GB），别混用。
++
++**本版源码包**：`E:\s6ke\dist\android_kernel_eebbk_sm6150_final_<提交号>.zip`，
++由本提交直接 `git archive HEAD` 生成（247 MB / 79542 个文件；zip 的 md5 无法写进它自己，
++以交付说明里给出的为准）。对应提交见文首「本版提交」。
++
++### 刷机
++
++```powershell
++adb reboot fastboot            # 走 fastbootd（is-usability: yes）
++fastboot flash boot E:\s6ke\dist\boot_container_release.img
++fastboot reboot
++```
++
++卡开机自救（按键进 fastboot 后刷回）：`E:\s6ke\dist\自救-fastboot刷回.md`，
++现成脚本 `E:\s6ke\work\tools\restore_vendor.ps1`（vendor）、
++`E:\s6ke\work\tools\flash_verify_container.ps1 -Rollback`（boot）。
++
++---
++
++## 五、已知问题（诚实清单）
++
++1. **「用久了所有声音全哑」**：根因已复现（`EEBBK_S6_changes.md` 第十三节）——
++   HAL 的扬声器保护回采流在 ASM Loopback FE 上没有后端 DAI，必然失败 →
++   `iv_feedback_count` 泄漏 → 扬声器路由卡死，**重启恢复**。
++   闭源 HAL 里的计数改不了，可行修法：把 `/vendor/build.prop` 的
++   `vendor.audio.feature.spkr_prot.enable` 改成 `false`（用 KSU 模块 bind-mount 覆盖最稳，未做）。
++2. **Android 15/16 GSI**：AOSP 已强制内核 ≥ 5.4（`NetBpfLoad: enforce kernel 5.4`），
++   本树只有 4.14 时代的 BPF（无 BTF/ringbuf/bpf_link/JMP32/新 verifier），
++   移植量参考同类机型 **约 1444 个提交**，详见 `docs/bpf-gsi-feasibility.md`。
++3. **/vendor 瘦身**：镜像本身是对的（逐文件比对只差 26 个 APK + build.prop 一行），
++   但刷入卡第一屏（verity 未同步 / 写入被中断），已回滚，`docs/vendor-mod-attempt.md`。
++4. 厂家下降闭环重试（`add_time`）未实现，下降贴合靠 `cali_time=3630` 标定。
+diff --git a/docs/bpf-gsi-feasibility.md b/docs/bpf-gsi-feasibility.md
+new file mode 100755
+index 000000000..0d3822b3c
+--- /dev/null
++++ b/docs/bpf-gsi-feasibility.md
+@@ -0,0 +1,140 @@
++# 在 EEBBK S6（sm6150 / kernel 4.14.190）上跑 Android 15/16 GSI：BPF 反向移植可行性评估
++
++日期：2026-09-19　设备：EEBBK S6（adb `7013T3603C41X`，fastboot `2fa7c794`，已解锁）
++内核：本仓库自编 `4.14.190-perf`（clang 11.1.0 + lld，已带 ReSukiSU）
++触发来源：酷安帖 `https://www.coolapk.com/feed/64983795`（作者 tiffanyy，2025-05-25，「补 bpf」）
++
++---
++
++## 0. 结论先说
++
++1. **纯 BPF 层面：技术上可行，但工作量是「千级提交」量级，不是一次改动能收的。**
++   * 实测同类机型：小米 sm8250（4.19 内核）的 `backport-5.10-bpf` 分支相对它的 A15 分支
++     **+1444 个提交**（GitHub compare API：`ahead_by = 1444`）。
++   * 4.14 的参考实现（MTK 天玑 1200 的 `jsdizkcksv/android_kernel_aresin`，默认分支就是 **A16**）
++     的 `kernel/bpf/` 已经从 4.14 原生的一小撮文件扩到含 **`btf.c`、`local_storage.c`、`cpumap.c`、
++     `disasm.c`、`offload.c`** —— 也就是把 5.x 的 BPF 子系统整体搬了进来。
++2. **但 BPF 不是唯一门槛。** A15/A16 GSI 还要过 Treble / vendor API 级别 / VNDK / HAL 这几关，
++   本机 vendor 是 Android 11（API 30）原厂。这一层过不去的话，BPF 做完也开不了机。
++3. **建议路线：先拿 A13 / A14 GSI 验证整条链路**（社区经验：4.14 内核原本能开 A13），
++   确认真机硬件/HAL 能跑起来，再决定是否为 A15/A16 做这笔 BPF 大移植。
++
++---
++
++## 1. 官方硬要求（已核实，不是传言）
++
++| 项 | 内容 | 证据 |
++|---|---|---|
++| AOSP 提交 | **"NetBpfLoad: enforce kernel 5.4 for Android W"**，Merged 2025-01-14 | `platform/packages/modules/Connectivity` change **3285058**（`android-review.googlesource.com` 查询，作者 Maciej Żenczykowski / Patrick Rohr） |
++| 后果 | 内核 < 5.4 时 bpf loader 拒绝加载，重启日志 `bpfloader-failed`，表现为「一屏重启回主系统」 | 同上 + 酷安帖描述 |
++| 两条路 | ① 内核反向移植 A15/A16 所需的 BPF（社区叫「合并 BPF」）；② system 层用 GSI 里已处理好的 BPF | 酷安帖；作者明确说 A16 阶段 ② 暂不可行（BPF 程序终究要内核接受） |
++
++---
++
++## 2. 我们这棵 4.14.190 现在的 BPF 家底（实测，非推测）
++
++**配置（`out_ksu_rel/.config`）——帖子里列的 8 项依赖我们全都有：**
++
++```
++CONFIG_CGROUP_BPF=y            CONFIG_BPF=y
++CONFIG_BPF_SYSCALL=y           CONFIG_BPF_JIT_ALWAYS_ON=y
++CONFIG_NETFILTER_XT_MATCH_BPF=y CONFIG_NET_CLS_BPF=y
++CONFIG_BPF_JIT=y               CONFIG_HAVE_EBPF_JIT=y
++（CONFIG_BPF_EVENTS=y；CONFIG_DEBUG_INFO_BTF 没有）
++```
++
++**`kernel/bpf/` 现有文件（4.14 原生规模）**
++`arraymap.c bpf_lru_list.c cgroup.c core.c devmap.c hashtab.c helpers.c inode.c lpm_trie.c
++ map_in_map.c percpu_freelist.c sockmap.c stackmap.c syscall.c tnum.c verifier.c`
++
++**map 类型（16）**：ARRAY、HASH、PERCPU_ARRAY/HASH、LRU_HASH、LRU_PERCPU_HASH、LPM_TRIE、
++ARRAY_OF_MAPS、HASH_OF_MAPS、PROG_ARRAY、PERF_EVENT_ARRAY、CGROUP_ARRAY、DEVMAP、SOCKMAP、STACK_TRACE
++
++**prog 类型（17）**：SOCKET_FILTER、KPROBE、SCHED_CLS、SCHED_ACT、TRACEPOINT、RAW_TRACEPOINT、
++XDP、PERF_EVENT、CGROUP_SKB、CGROUP_SOCK、LWT_IN/OUT/XMIT、SK_SKB、SOCK_OPS
++
++**`bpf()` 命令只有 3 个**：`MAP_CREATE`、`PROG_LOAD`、`PROG_TEST_RUN`
++（没有 `BTF_LOAD`、没有 `LINK_CREATE`）
++
++**明确缺失**：BTF（`btf.c`/`BTF_KIND_*`）、`RINGBUF`、`SK_STORAGE`、`QUEUE`/`STACK`、`STRUCT_OPS`、
++`bpf_link`、`BPF_JMP32`、`bpf_iter`、`BPF_PROG_TYPE_EXT/LSM`、`BPF_FUNC_ringbuf_*`、`BPF_FUNC_spin_lock` 等
++
++---
++
++## 3. 缺口清单（按依赖顺序，也就是要合的东西）
++
++1. **基础设施**：BTF 全套（`kernel/bpf/btf.c`、`BTF_LOAD`、`BTF_KIND_*`、verifier 里的 BTF 校验、
++   `CONFIG_DEBUG_INFO_BTF`）——A16 的「ebpf 模块」按帖子说就要 BTF。
++2. **新 map 类型**：`RINGBUF`（5.8）、`SK_STORAGE`（5.2）、`QUEUE`/`STACK`（4.20）、
++   `STRUCT_OPS`（5.6）、`CGROUP_STORAGE`，以及 `BPF_F_LOCK`/`bpf_spin_lock` 语义。
++3. **新 prog 类型与挂载方式**：`BPF_PROG_TYPE_EXT`（5.6）、`STRUCT_OPS`（5.6）、`LSM`（5.7）、
++   `bpf_link` / `LINK_CREATE`（5.7）——A15/A16 的 libbpf/bpfloader 会用到。
++4. **指令集与 verifier**：`BPF_JMP32`（5.1）、有界循环验证（5.3）、verifier 精度跟踪与状态裁剪
++   （5.x 对 `verifier.c` 是大改，冲突最重的一块）、`BPF_PSEUDO_MAP_VALUE` 等。
++5. **arch 侧**：`arch/arm64/net/bpf_jit_comp.c` 支持新指令（JMP32 等）与 `bpf_jit_binary_*` 新接口。
++6. **顺带被带进来的非 BPF 部分**：参考分支的 diff 里能看到 RCU、timekeeping、cgroup v2、
++   LSM/SafeSetID、`Documentation/*` 等——因为 5.10 的 BPF 代码依赖这些较新的内核基础设施。
++   **这一条是最容易被低估的成本**：不是「只改 BPF 目录」，而是「把内核若干个核心子系统抬到 5.x 水位」。
++
++---
++
++## 4. 参考实现（可直接作为移植来源）
++
++| 仓库 | 分支 | 机型 / 内核 | 用途 |
++|---|---|---|---|
++| `jsdizkcksv/android_kernel_aresin` | **A16** | 小米 POCO F3 GT / K40 GE（MTK 天玑 1200，**内核 4.14**） | **和我们最接近**：4.14 + A16 的完整树，`kernel/bpf/` 已含 `btf.c`、`local_storage.c`、`cpumap.c`、`disasm.c`、`offload.c` |
++| `ApartTUSITU/kernel_xiaomi_sm8250_mod` | `backport-5.10-bpf` | 小米 sm8250（4.19） | 已量化：相对其 A15 分支 **+1444 提交**；另有 `backport-5.4-bpf` |
++| `MTK6893/lineage_kernel_xiaomi_sdm845` | `lineage-23.0` | sdm845（4.9/4.19） | 4.9→5.10 的参考（帖子 25.9.14 更新） |
++| `jsdizkcksv/android_kernel_xiaomi_sdm660` | `main` / `BACKPORT/erofs` | sdm660 | 4.4→5.10 的参考 |
++
++**做法**：不是从零写，而是选一棵最接近的树（aresin，4.14+A16）做 **BPF 相关提交的筛选与 cherry-pick**，
++逐条对照我们这棵树（mtk vs qcom 的 arch/JIT 差异、我们的 techpack 音频栈等）解决冲突。
++
++---
++
++## 5. 工作量与风险（诚实评估）
++
++* **量级**：千级提交；`kernel/bpf` 从 16 个文件扩到 5.x 规模（20+），`verifier.c` 几乎重写。
++* **风险**：BPF verifier 是安全敏感区，合错会导致内核不稳定/开机循环；每轮验证要刷机 8~10 分钟
++  （本机刷 boot 已很熟练，回滚镜像齐全）。
++* **分阶段建议**：
++  * **P1（低风险，1~2 天）**：先合「被 bpfloader 硬校验」的最小集（BTF + `BTF_LOAD` + `bpf_link` +
++    `JMP32` + `ringbuf`），编一版内核看 A15 的 bpf 程序能否被接受；预期仍会因 verifier 差异失败，
++    但能拿到真实的失败点（`dmesg` 里的 verifier 报错），为 P2 定范围。
++  * **P2（大头）**：按 aresin 树把 verifier / 其余 map / prog 类型补齐（这就是那 1444 提交的主体）。
++  * **P3**：A16 特有（BTF 强依赖、ebpf 模块要求）+ 边界情况。
++* **验证手段**：`logcat | grep -i bpfloader`、`ls -l /sys/fs/bpf`、`dmesg | grep -i bpf`、
++  `getprop ro.kernel.version`；设备上没有 `bpftool`，需要的话我可以静态编一个塞进 ramdisk。
++
++---
++
++## 6. 非 BPF 门槛（必须先确认，否则 BPF 白做）
++
++1. **Vendor API level / VNDK**：本机 vendor 是 Android 11。A15/A16 GSI 对 vendor API level 有要求，
++   且 VNDK 版本要对得上；对不上会卡在 `linker`/HAL 加载。
++2. **HAL 兼容**：相机（含升降前摄服务）、音频（techpack + awinic）、传感器等 OEM HAL 都是 A11 时代的，
++   GSI 只能用 `android.hardware.*@2.x` 这一代的接口；哪几个能跑要实测。
++3. **分区布局**：本机 `super` 里有 system/product/vendor 等逻辑分区，GSI 刷 system 分区即可，
++   不动 vendor；刷前建议先 `fastboot fetch` 回读校验（我们踩过「刷完卡第一屏、只能按键进 fastboot 恢复」的坑，
++   见 `vendor-mod-attempt.md`）。
++
++---
++
++## 7. 建议的下一步（可执行）
++
++1. **先做 A13/A14 GSI 试刷**（只动 system 分区，风险低、可快速回滚），验证「非 BPF 门槛」；
++   这一步完全不需要改内核，能立刻给出「这台机器到底能不能跑新版 Android」的答案。
++2. 同时我把 `aresin` 树 **BPF 相关提交清单**导出（按 `kernel/bpf`、`include/linux/bpf*`、
++   `include/uapi/linux/bpf.h`、`net/core/filter.c`、`arch/arm64/net/bpf_jit_comp.c` 分文件统计），
++   逐条标注「可直接 cherry-pick / 需手工改 / 与我们无关」，把「1444 提交」变成可执行的移植计划。
++3. 拿到 1、2 的结果再决定要不要开工 P1/P2。
++
++---
++
++## 附：怎么自己精确拿到「GSI 的 BPF 程序需要哪些特性」
++
++GSI 里 `com.android.tethering` / `system/bpf` 的预编译 `*.o` 就在 APEX 内：
++`/apex/com.android.tethering/etc/bpf/*.o`、`/system/etc/bpf/*.o`。把它们拉出来，
++用 `llvm-objdump -h` 看 section（`cgroup_skb/ingress`、`sched_cls/...` 等），
++再看 `maps` section 里的 `BPF_MAP_TYPE_*` 与重定位到 `bpf_*` 的 helper 列表，
++就能得到**精确**的需求清单（比读源码更可靠）。需要的话我写个脚本一键出表。
+diff --git a/docs/vendor-mod-attempt.md b/docs/vendor-mod-attempt.md
+new file mode 100755
+index 000000000..74a4a5e4a
+--- /dev/null
++++ b/docs/vendor-mod-attempt.md
+@@ -0,0 +1,48 @@
++# /vendor 瘦身 + 关 speaker protection：第一次尝试记录（2026-09-19）
++
++## 目标
++1. 删掉 `/vendor/dataapp` 里 26 个预装 APK（2.2 GB）。
++2. 在 `/vendor/build.prop` 把 `vendor.audio.feature.spkr_prot.enable` 改成 `false`
++   （HAL 的 VI 回采捕获流因 ASM Loopback 没有后端 DAI 必然失败 → `iv_feedback_count`
++   泄漏 → 扬声器路由卡死 → 全部声音哑；已在真机复现，见下）。
++
++## 做了什么
++* `E:\s6ke\vendor\vendor.img`（原厂，2.8 GB，md5 `0294a266a68c1fc6e5be3692b208ff08`）只读挂载 → 整树拷出。
++* 删掉 26 个 APK；`build.prop` 第 134 行 `...spkr_prot.enable=true` → `false`（原厂本来就是显式 `true`）。
++* 原镜像带 `shared_blocks`（Android 去重特性）→ Linux 只能只读挂载，无法原地改；
++  改为用 `mke2fs -d` 从目录树重建（实测 `mke2fs -d` **会保留 security.selinux 等 xattr**）。
++* 重建结果：`E:\s6ke\dist\vendor_slim.img`，694906880 字节（662 MiB），
++  md5 `1c0b9bf691eaa790d2be43a613f3f6c9`。
++* 与工厂镜像逐一对比（2744 → 2718 个文件）：**唯一差异就是那 26 个 APK + build.prop 一行**，
++  mode/uid/gid 差异 0、SELinux 标签差异 0、其它文件内容差异 0（symlink 的 mode 位忽略）。
++
++## 结果：刷入后卡在第一屏
++刷 `vendor_slim.img` 后平板停在开机动画第一屏，adb 不可用，只能按键进 fastboot 恢复。
++
++恢复过程（已成功）：
++```
++fastboot devices                       # 2fa7c794 fastboot（用户按键进入，已是 fastbootd）
++fastboot flash vendor E:\s6ke\vendor\vendor.img
++fastboot reboot
++```
++恢复后：`sys.boot_completed=1`、`/vendor/dataapp` 26 项、`spkr_prot=true`、
++内核仍是 KSU 调试镜像（`#1 ... Sat Sep 19 13:52:09`）。
++
++## 卡住的两个可能原因（未完全区分）
++1. **dm-verity**：vendor 的哈希写在 `vbmeta.img` 里，改了镜像但没同步 vbmeta →
++   init 挂载 /vendor 时校验失败直接卡住。这是改 super 内逻辑分区的常见后果。
++2. **刷写被中断**：那次刷写所在的命令被会话中断（`tool call aborted`），
++   vendor 分区可能只写了一半 → 文件系统不完整同样卡第一屏。
++
++## 下次要试的话（按顺序）
++1. 先在 fastbootd 里刷完就**校验回读**（避免盲目重启）：
++   `fastboot fetch vendor readback.img` 后比对 md5（Android 11 的 fastboot 支持）。
++2. 若回读一致仍然卡 → 判定为 dm-verity，先关校验再刷：
++   `fastboot --disable-verity --disable-verification flash vbmeta E:\s6ke\imgdata\vbmeta.img`
++   （必要时连 `vbmeta_system.img` 一起）。
++3. 回滚始终可用：`E:\s6ke\vendor\vendor.img`（未改动）+ `E:\s6ke\work\tools\restore_vendor.ps1`。
++
++## 不刷分区的替代方案（更稳，推荐）
++* 应用：`adb shell pm uninstall --user 0 <包名>` 逐个卸掉（只清 /data 里的副本，不动 vendor）。
++* 音频属性：做成一个 **KSU 模块**（开机 `post-fs-data.sh` 里 bind-mount 一份
++  `spkr_prot=false` 的 build.prop 覆盖 `/vendor/build.prop`），随时可禁用、无刷机风险。
+# 08-docs
+#
+# 文档：技术总账、过程记录、README、docs/ 下的两份专题报告
+#
+# 由 git diff 525066d92..HEAD -- <下列路径> 生成：
+#   EEBBK_S6_changes.md
+#   EEBBK_S6_progress.md
+#   README.md
+#   docs/bpf-gsi-feasibility.md
+#   docs/vendor-mod-attempt.md
+

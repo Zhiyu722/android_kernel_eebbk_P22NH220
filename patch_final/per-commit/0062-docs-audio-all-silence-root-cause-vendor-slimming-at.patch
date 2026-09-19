@@ -1,0 +1,322 @@
+From 62c44f9efb0f883216c448f65d8b6ebe5c574403 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 15:03:13 +0800
+Subject: [PATCH 62/67] docs: audio all-silence root cause, vendor slimming
+ attempt, BPF/GSI assessment
+
+* section 13: reproduce and explain the "after a while every sound dies" bug.
+  Playing three rounds of media makes the HAL's speaker-protection capture fail
+  ("SM6150 ASM Loopback: ASoC: no backend DAIs enabled"): the ASM Loopback DPCM
+  front end has no backend DAI attached because the vendor mixer path only sets
+  TERT_MI2S_RX_VI_FB_MUX, never an FE->BE control.  The HAL's iv_feedback_count
+  then never returns to zero, disable_snd_device(speaker) refuses to tear the
+  route down and the speaker path sticks until reboot.  Both iv_feedback_count
+  and spkr_prot live in the closed-source HAL, so the kernel can only make that
+  path succeed or stop it from being taken.
+* section 14 + docs/vendor-mod-attempt.md: slimming /vendor.  The factory image
+  carries the shared_blocks dedup feature (read-only for Linux), so it was
+  rebuilt from a directory tree with mke2fs -d; result is byte-identical to the
+  factory image apart from the 26 deleted dataapp APKs and one build.prop line.
+  Flashing it hung on the first boot screen (verity and/or an interrupted write)
+  and was rolled back to the factory vendor image.
+* section 15 + docs/bpf-gsi-feasibility.md: what running an Android 15/16 GSI
+  would take.  AOSP enforces kernel 5.4 in the bpf loader (Connectivity change
+  3285058); this tree already has all eight defconfig options the community
+  checklist asks for, but none of the 5.x BPF machinery (BTF, ringbuf,
+  sk_storage, bpf_link, JMP32, new prog types, the 5.x verifier).  Measured
+  reference: 1444 commits for a comparable 4.19 device.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ EEBBK_S6_changes.md         |  77 ++++++++++++++++++++
+ docs/bpf-gsi-feasibility.md | 140 ++++++++++++++++++++++++++++++++++++
+ docs/vendor-mod-attempt.md  |  48 +++++++++++++
+ 3 files changed, 265 insertions(+)
+ create mode 100755 docs/bpf-gsi-feasibility.md
+ create mode 100755 docs/vendor-mod-attempt.md
+
+diff --git a/EEBBK_S6_changes.md b/EEBBK_S6_changes.md
+index e392c7767..a416f1e7c 100755
+--- a/EEBBK_S6_changes.md
++++ b/EEBBK_S6_changes.md
+@@ -934,3 +934,80 @@ App 需要用户自己装（官方 release，与内核版本号对齐）：
+ * 或者把 config 里的 `CONFIG_KSU` 改成 `# CONFIG_KSU is not set` 重编（注意 KSU 关闭后
+   `KernelSU/kernel/Kbuild` 里的钩子检查不会执行，源码里的 4 处钩子留在那里也无副作用）；
+ * KSU 只在内核里增加钩子，没有改 `avb`/`verity`/`vbmeta`，所以刷回原镜像就是完全恢复。
++
++## 十三、音频「用久了全哑」的根因：真机复现 + 机制（2026-09-19）
++
++### 1. 复现方法（不依赖「用很久」，随时可复现）
++
++刷当前调试镜像，清日志后连放 3 轮音乐（`com.eebbk.musicplayer`），内核与 HAL 日志同时抓：
++
++```
++# dmesg（内核）
++[ 924.188492] SM6150 ASM Loopback: ASoC: no backend DAIs enabled for SM6150 ASM Loopback
++# logcat（HAL，tag audio_hw_primary）
++D disable_snd_device: snd_device(2: speaker)
++E  snd_card_name =sm6150-wcd9375-snd-card
++D disable_snd_device: iv_feedback_count-- befor=2
++D aw_is_supported_feedback_on_device [Awinic] 2 ret=1
++D disable_snd_device: iv_feedback_count-- after=1
++E disable_snd_device: iv_feedback_count = 1, can't stop feedback!
++```
++
++### 2. 机制（已能解释全部现象）
++
++1. `vendor.audio.feature.spkr_prot.enable=true`（在 `/vendor/build.prop` 第 134 行显式打开），
++   HAL（`/vendor/lib64/hw/audio.primary.sm6150.so`）于是走扬声器保护流程：
++   `audio_route` 应用 `spkr-vi-record` 路径 → 设 `TERT_MI2S_RX_VI_FB_MUX=TERT_MI2S_TX`
++   （这个 mux 原厂内核里有，我们这棵树原本缺，已在前面的提交补回）→ 再打开一路 **capture**。
++2. 那路 capture 落在 FE `SM6150 ASM Loopback`（machine driver `techpack/audio/asoc/sm6150.c`，
++   `MSM_FRONTEND_DAI_MULTIMEDIA6`，`dynamic=1` + `dpcm_capture=1`）。DPCM 要求该方向至少挂一个后端 DAI，
++   而 vendor HAL 的 mixer 路径里**没有任何** “MultiMedia6 Mixer TERT_MI2S_TX” 这类 FE→BE 连接控制
++   （routing 表里这条路由是存在的，见 `msm-pcm-routing-v2.c` 第 23385 行），所以 `be_clients` 为空 →
++   `dpcm_fe_dai_prepare()` 直接 `-EINVAL` → 内核这句 `no backend DAIs enabled`。
++3. HAL 的 `iv_feedback_count` 因此永远回不到 0：每放一轮它就少减一次，
++   `disable_snd_device(speaker)` 判断计数非 0 就**拒绝关掉扬声器**，
++   于是扬声器路由一直卡在“已开”状态；再叠加 awinic 回采启动失败（`pcm start for TX failed`），
++   最终表现就是「用久了所有声音全哑」，重启复位后恢复。
++
++### 3. 两条可行修法（都还没在真机上收尾）
++
++| 修法 | 做法 | 状态 |
++|---|---|---|
++| ROM 侧关掉这个功能（推荐，简单） | `/vendor/build.prop` 里 `vendor.audio.feature.spkr_prot.enable=false` | 镜像已做好（`dist/vendor_slim.img`），但**刷入卡在第一屏**，已回滚，详见第十四节 |
++| 不刷分区 | 用 KSU 模块开机 bind-mount 一份改好的 build.prop 覆盖 `/vendor/build.prop` | 待做（需要 App 装好、启用模块） |
++| 内核侧（治本但深） | 让这路 capture 能成功：自动把 FE 挂到 BE（routing 里已有 `MultiMedia6 Mixer TERT_MI2S_TX` 路由），或把该 FE 的 capture 改成非 DPCM | 未做，需要评估对其它 MultiMedia6 用例的影响 |
++
++**重要**：`iv_feedback_count` 与 `spkr_prot` 都在闭源 HAL 里（`grep -rl iv_feedback /vendor/lib64` 只命中
++`audio.primary.sm6150.so`），内核侧改不了它的计数逻辑，只能让它走不通的那条路不再被走到。
++
++---
++
++## 十四、/vendor 瘦身 + 关 speaker protection：一次尝试与回滚（2026-09-19）
++
++完整记录见 `docs/vendor-mod-attempt.md`，结论：
++
++* `/vendor/dataapp` 里 26 个预装 APK 占 **2.2 GB**（`/vendor/app` 只有 12 MB 且都是高通系统服务，不能删）。
++* 原镜像带 `shared_blocks`（Android 去重特性）→ Linux 只能**只读**挂载，无法原地改；
++  改用「只读挂载取树 → 删文件/改属性 → `mke2fs -d` 重建」的做法（实测 `mke2fs -d` **保留 security.selinux**）。
++* 产出 `dist/vendor_slim.img`：662 MiB（原 2.8 GB），md5 `1c0b9bf691eaa790d2be43a613f3f6c9`；
++  与工厂镜像逐文件对比：**除 26 个 APK 与 build.prop 一行外，权限/属主/SELinux 标签/内容差异全为 0**。
++* 刷入后**卡在第一屏**（两种可能：① 改了 vendor 但没同步 `vbmeta` → dm-verity 校验失败；
++  ② 那次刷写被会话中断，分区只写了一半）。恢复手段：按键进 fastbootd →
++  `fastboot flash vendor E:\s6ke\vendor\vendor.img` → 重启，已恢复正常（脚本 `work/tools/restore_vendor.ps1`）。
++* **当前决定：vendor 先不动**。要再试的话，先在 fastbootd 里 `fastboot fetch` 回读比对 md5，
++  一致再重启；若是 verity 问题就先刷带 `--disable-verity --disable-verification` 的 `vbmeta`。
++
++---
++
++## 十五、Android 15/16 GSI 的 BPF 可行性评估（2026-09-19）
++
++完整评估见 `docs/bpf-gsi-feasibility.md`，要点：
++
++* AOSP `platform/packages/modules/Connectivity` 提交 **"NetBpfLoad: enforce kernel 5.4 for Android W"**
++  （Merged 2025-01-14，change 3285058）→ 内核 < 5.4 直接拒绝加载 BPF，表现为一屏重启（`bpfloader-failed`）。
++* 我们这棵树**帖子里列的 8 项 defconfig 依赖全都有**；缺的是 5.x 那一整套：
++  BTF、`RINGBUF`/`SK_STORAGE`/`QUEUE/STACK`/`STRUCT_OPS`、`bpf_link`、`BPF_JMP32`、
++  `BPF_PROG_TYPE_EXT/LSM`，以及 5.x 的 verifier（`bpf()` 目前只有 `MAP_CREATE`/`PROG_LOAD`/`PROG_TEST_RUN`）。
++* 量级参考（实测）：小米 sm8250 的 `backport-5.10-bpf` 相对其 A15 分支 **+1444 提交**；
++  MTK 天玑 1200（**同是 4.14**）的 `android_kernel_aresin` A16 分支已含 `btf.c`、`local_storage.c` 等。
++* 建议：**先用 A13/A14 GSI 验证非 BPF 门槛**（vendor API level / VNDK / OEM HAL），再决定是否开工 BPF 大移植。
+diff --git a/docs/bpf-gsi-feasibility.md b/docs/bpf-gsi-feasibility.md
+new file mode 100755
+index 000000000..0d3822b3c
+--- /dev/null
++++ b/docs/bpf-gsi-feasibility.md
+@@ -0,0 +1,140 @@
++# 在 EEBBK S6（sm6150 / kernel 4.14.190）上跑 Android 15/16 GSI：BPF 反向移植可行性评估
++
++日期：2026-09-19　设备：EEBBK S6（adb `7013T3603C41X`，fastboot `2fa7c794`，已解锁）
++内核：本仓库自编 `4.14.190-perf`（clang 11.1.0 + lld，已带 ReSukiSU）
++触发来源：酷安帖 `https://www.coolapk.com/feed/64983795`（作者 tiffanyy，2025-05-25，「补 bpf」）
++
++---
++
++## 0. 结论先说
++
++1. **纯 BPF 层面：技术上可行，但工作量是「千级提交」量级，不是一次改动能收的。**
++   * 实测同类机型：小米 sm8250（4.19 内核）的 `backport-5.10-bpf` 分支相对它的 A15 分支
++     **+1444 个提交**（GitHub compare API：`ahead_by = 1444`）。
++   * 4.14 的参考实现（MTK 天玑 1200 的 `jsdizkcksv/android_kernel_aresin`，默认分支就是 **A16**）
++     的 `kernel/bpf/` 已经从 4.14 原生的一小撮文件扩到含 **`btf.c`、`local_storage.c`、`cpumap.c`、
++     `disasm.c`、`offload.c`** —— 也就是把 5.x 的 BPF 子系统整体搬了进来。
++2. **但 BPF 不是唯一门槛。** A15/A16 GSI 还要过 Treble / vendor API 级别 / VNDK / HAL 这几关，
++   本机 vendor 是 Android 11（API 30）原厂。这一层过不去的话，BPF 做完也开不了机。
++3. **建议路线：先拿 A13 / A14 GSI 验证整条链路**（社区经验：4.14 内核原本能开 A13），
++   确认真机硬件/HAL 能跑起来，再决定是否为 A15/A16 做这笔 BPF 大移植。
++
++---
++
++## 1. 官方硬要求（已核实，不是传言）
++
++| 项 | 内容 | 证据 |
++|---|---|---|
++| AOSP 提交 | **"NetBpfLoad: enforce kernel 5.4 for Android W"**，Merged 2025-01-14 | `platform/packages/modules/Connectivity` change **3285058**（`android-review.googlesource.com` 查询，作者 Maciej Żenczykowski / Patrick Rohr） |
++| 后果 | 内核 < 5.4 时 bpf loader 拒绝加载，重启日志 `bpfloader-failed`，表现为「一屏重启回主系统」 | 同上 + 酷安帖描述 |
++| 两条路 | ① 内核反向移植 A15/A16 所需的 BPF（社区叫「合并 BPF」）；② system 层用 GSI 里已处理好的 BPF | 酷安帖；作者明确说 A16 阶段 ② 暂不可行（BPF 程序终究要内核接受） |
++
++---
++
++## 2. 我们这棵 4.14.190 现在的 BPF 家底（实测，非推测）
++
++**配置（`out_ksu_rel/.config`）——帖子里列的 8 项依赖我们全都有：**
++
++```
++CONFIG_CGROUP_BPF=y            CONFIG_BPF=y
++CONFIG_BPF_SYSCALL=y           CONFIG_BPF_JIT_ALWAYS_ON=y
++CONFIG_NETFILTER_XT_MATCH_BPF=y CONFIG_NET_CLS_BPF=y
++CONFIG_BPF_JIT=y               CONFIG_HAVE_EBPF_JIT=y
++（CONFIG_BPF_EVENTS=y；CONFIG_DEBUG_INFO_BTF 没有）
++```
++
++**`kernel/bpf/` 现有文件（4.14 原生规模）**
++`arraymap.c bpf_lru_list.c cgroup.c core.c devmap.c hashtab.c helpers.c inode.c lpm_trie.c
++ map_in_map.c percpu_freelist.c sockmap.c stackmap.c syscall.c tnum.c verifier.c`
++
++**map 类型（16）**：ARRAY、HASH、PERCPU_ARRAY/HASH、LRU_HASH、LRU_PERCPU_HASH、LPM_TRIE、
++ARRAY_OF_MAPS、HASH_OF_MAPS、PROG_ARRAY、PERF_EVENT_ARRAY、CGROUP_ARRAY、DEVMAP、SOCKMAP、STACK_TRACE
++
++**prog 类型（17）**：SOCKET_FILTER、KPROBE、SCHED_CLS、SCHED_ACT、TRACEPOINT、RAW_TRACEPOINT、
++XDP、PERF_EVENT、CGROUP_SKB、CGROUP_SOCK、LWT_IN/OUT/XMIT、SK_SKB、SOCK_OPS
++
++**`bpf()` 命令只有 3 个**：`MAP_CREATE`、`PROG_LOAD`、`PROG_TEST_RUN`
++（没有 `BTF_LOAD`、没有 `LINK_CREATE`）
++
++**明确缺失**：BTF（`btf.c`/`BTF_KIND_*`）、`RINGBUF`、`SK_STORAGE`、`QUEUE`/`STACK`、`STRUCT_OPS`、
++`bpf_link`、`BPF_JMP32`、`bpf_iter`、`BPF_PROG_TYPE_EXT/LSM`、`BPF_FUNC_ringbuf_*`、`BPF_FUNC_spin_lock` 等
++
++---
++
++## 3. 缺口清单（按依赖顺序，也就是要合的东西）
++
++1. **基础设施**：BTF 全套（`kernel/bpf/btf.c`、`BTF_LOAD`、`BTF_KIND_*`、verifier 里的 BTF 校验、
++   `CONFIG_DEBUG_INFO_BTF`）——A16 的「ebpf 模块」按帖子说就要 BTF。
++2. **新 map 类型**：`RINGBUF`（5.8）、`SK_STORAGE`（5.2）、`QUEUE`/`STACK`（4.20）、
++   `STRUCT_OPS`（5.6）、`CGROUP_STORAGE`，以及 `BPF_F_LOCK`/`bpf_spin_lock` 语义。
++3. **新 prog 类型与挂载方式**：`BPF_PROG_TYPE_EXT`（5.6）、`STRUCT_OPS`（5.6）、`LSM`（5.7）、
++   `bpf_link` / `LINK_CREATE`（5.7）——A15/A16 的 libbpf/bpfloader 会用到。
++4. **指令集与 verifier**：`BPF_JMP32`（5.1）、有界循环验证（5.3）、verifier 精度跟踪与状态裁剪
++   （5.x 对 `verifier.c` 是大改，冲突最重的一块）、`BPF_PSEUDO_MAP_VALUE` 等。
++5. **arch 侧**：`arch/arm64/net/bpf_jit_comp.c` 支持新指令（JMP32 等）与 `bpf_jit_binary_*` 新接口。
++6. **顺带被带进来的非 BPF 部分**：参考分支的 diff 里能看到 RCU、timekeeping、cgroup v2、
++   LSM/SafeSetID、`Documentation/*` 等——因为 5.10 的 BPF 代码依赖这些较新的内核基础设施。
++   **这一条是最容易被低估的成本**：不是「只改 BPF 目录」，而是「把内核若干个核心子系统抬到 5.x 水位」。
++
++---
++
++## 4. 参考实现（可直接作为移植来源）
++
++| 仓库 | 分支 | 机型 / 内核 | 用途 |
++|---|---|---|---|
++| `jsdizkcksv/android_kernel_aresin` | **A16** | 小米 POCO F3 GT / K40 GE（MTK 天玑 1200，**内核 4.14**） | **和我们最接近**：4.14 + A16 的完整树，`kernel/bpf/` 已含 `btf.c`、`local_storage.c`、`cpumap.c`、`disasm.c`、`offload.c` |
++| `ApartTUSITU/kernel_xiaomi_sm8250_mod` | `backport-5.10-bpf` | 小米 sm8250（4.19） | 已量化：相对其 A15 分支 **+1444 提交**；另有 `backport-5.4-bpf` |
++| `MTK6893/lineage_kernel_xiaomi_sdm845` | `lineage-23.0` | sdm845（4.9/4.19） | 4.9→5.10 的参考（帖子 25.9.14 更新） |
++| `jsdizkcksv/android_kernel_xiaomi_sdm660` | `main` / `BACKPORT/erofs` | sdm660 | 4.4→5.10 的参考 |
++
++**做法**：不是从零写，而是选一棵最接近的树（aresin，4.14+A16）做 **BPF 相关提交的筛选与 cherry-pick**，
++逐条对照我们这棵树（mtk vs qcom 的 arch/JIT 差异、我们的 techpack 音频栈等）解决冲突。
++
++---
++
++## 5. 工作量与风险（诚实评估）
++
++* **量级**：千级提交；`kernel/bpf` 从 16 个文件扩到 5.x 规模（20+），`verifier.c` 几乎重写。
++* **风险**：BPF verifier 是安全敏感区，合错会导致内核不稳定/开机循环；每轮验证要刷机 8~10 分钟
++  （本机刷 boot 已很熟练，回滚镜像齐全）。
++* **分阶段建议**：
++  * **P1（低风险，1~2 天）**：先合「被 bpfloader 硬校验」的最小集（BTF + `BTF_LOAD` + `bpf_link` +
++    `JMP32` + `ringbuf`），编一版内核看 A15 的 bpf 程序能否被接受；预期仍会因 verifier 差异失败，
++    但能拿到真实的失败点（`dmesg` 里的 verifier 报错），为 P2 定范围。
++  * **P2（大头）**：按 aresin 树把 verifier / 其余 map / prog 类型补齐（这就是那 1444 提交的主体）。
++  * **P3**：A16 特有（BTF 强依赖、ebpf 模块要求）+ 边界情况。
++* **验证手段**：`logcat | grep -i bpfloader`、`ls -l /sys/fs/bpf`、`dmesg | grep -i bpf`、
++  `getprop ro.kernel.version`；设备上没有 `bpftool`，需要的话我可以静态编一个塞进 ramdisk。
++
++---
++
++## 6. 非 BPF 门槛（必须先确认，否则 BPF 白做）
++
++1. **Vendor API level / VNDK**：本机 vendor 是 Android 11。A15/A16 GSI 对 vendor API level 有要求，
++   且 VNDK 版本要对得上；对不上会卡在 `linker`/HAL 加载。
++2. **HAL 兼容**：相机（含升降前摄服务）、音频（techpack + awinic）、传感器等 OEM HAL 都是 A11 时代的，
++   GSI 只能用 `android.hardware.*@2.x` 这一代的接口；哪几个能跑要实测。
++3. **分区布局**：本机 `super` 里有 system/product/vendor 等逻辑分区，GSI 刷 system 分区即可，
++   不动 vendor；刷前建议先 `fastboot fetch` 回读校验（我们踩过「刷完卡第一屏、只能按键进 fastboot 恢复」的坑，
++   见 `vendor-mod-attempt.md`）。
++
++---
++
++## 7. 建议的下一步（可执行）
++
++1. **先做 A13/A14 GSI 试刷**（只动 system 分区，风险低、可快速回滚），验证「非 BPF 门槛」；
++   这一步完全不需要改内核，能立刻给出「这台机器到底能不能跑新版 Android」的答案。
++2. 同时我把 `aresin` 树 **BPF 相关提交清单**导出（按 `kernel/bpf`、`include/linux/bpf*`、
++   `include/uapi/linux/bpf.h`、`net/core/filter.c`、`arch/arm64/net/bpf_jit_comp.c` 分文件统计），
++   逐条标注「可直接 cherry-pick / 需手工改 / 与我们无关」，把「1444 提交」变成可执行的移植计划。
++3. 拿到 1、2 的结果再决定要不要开工 P1/P2。
++
++---
++
++## 附：怎么自己精确拿到「GSI 的 BPF 程序需要哪些特性」
++
++GSI 里 `com.android.tethering` / `system/bpf` 的预编译 `*.o` 就在 APEX 内：
++`/apex/com.android.tethering/etc/bpf/*.o`、`/system/etc/bpf/*.o`。把它们拉出来，
++用 `llvm-objdump -h` 看 section（`cgroup_skb/ingress`、`sched_cls/...` 等），
++再看 `maps` section 里的 `BPF_MAP_TYPE_*` 与重定位到 `bpf_*` 的 helper 列表，
++就能得到**精确**的需求清单（比读源码更可靠）。需要的话我写个脚本一键出表。
+diff --git a/docs/vendor-mod-attempt.md b/docs/vendor-mod-attempt.md
+new file mode 100755
+index 000000000..74a4a5e4a
+--- /dev/null
++++ b/docs/vendor-mod-attempt.md
+@@ -0,0 +1,48 @@
++# /vendor 瘦身 + 关 speaker protection：第一次尝试记录（2026-09-19）
++
++## 目标
++1. 删掉 `/vendor/dataapp` 里 26 个预装 APK（2.2 GB）。
++2. 在 `/vendor/build.prop` 把 `vendor.audio.feature.spkr_prot.enable` 改成 `false`
++   （HAL 的 VI 回采捕获流因 ASM Loopback 没有后端 DAI 必然失败 → `iv_feedback_count`
++   泄漏 → 扬声器路由卡死 → 全部声音哑；已在真机复现，见下）。
++
++## 做了什么
++* `E:\s6ke\vendor\vendor.img`（原厂，2.8 GB，md5 `0294a266a68c1fc6e5be3692b208ff08`）只读挂载 → 整树拷出。
++* 删掉 26 个 APK；`build.prop` 第 134 行 `...spkr_prot.enable=true` → `false`（原厂本来就是显式 `true`）。
++* 原镜像带 `shared_blocks`（Android 去重特性）→ Linux 只能只读挂载，无法原地改；
++  改为用 `mke2fs -d` 从目录树重建（实测 `mke2fs -d` **会保留 security.selinux 等 xattr**）。
++* 重建结果：`E:\s6ke\dist\vendor_slim.img`，694906880 字节（662 MiB），
++  md5 `1c0b9bf691eaa790d2be43a613f3f6c9`。
++* 与工厂镜像逐一对比（2744 → 2718 个文件）：**唯一差异就是那 26 个 APK + build.prop 一行**，
++  mode/uid/gid 差异 0、SELinux 标签差异 0、其它文件内容差异 0（symlink 的 mode 位忽略）。
++
++## 结果：刷入后卡在第一屏
++刷 `vendor_slim.img` 后平板停在开机动画第一屏，adb 不可用，只能按键进 fastboot 恢复。
++
++恢复过程（已成功）：
++```
++fastboot devices                       # 2fa7c794 fastboot（用户按键进入，已是 fastbootd）
++fastboot flash vendor E:\s6ke\vendor\vendor.img
++fastboot reboot
++```
++恢复后：`sys.boot_completed=1`、`/vendor/dataapp` 26 项、`spkr_prot=true`、
++内核仍是 KSU 调试镜像（`#1 ... Sat Sep 19 13:52:09`）。
++
++## 卡住的两个可能原因（未完全区分）
++1. **dm-verity**：vendor 的哈希写在 `vbmeta.img` 里，改了镜像但没同步 vbmeta →
++   init 挂载 /vendor 时校验失败直接卡住。这是改 super 内逻辑分区的常见后果。
++2. **刷写被中断**：那次刷写所在的命令被会话中断（`tool call aborted`），
++   vendor 分区可能只写了一半 → 文件系统不完整同样卡第一屏。
++
++## 下次要试的话（按顺序）
++1. 先在 fastbootd 里刷完就**校验回读**（避免盲目重启）：
++   `fastboot fetch vendor readback.img` 后比对 md5（Android 11 的 fastboot 支持）。
++2. 若回读一致仍然卡 → 判定为 dm-verity，先关校验再刷：
++   `fastboot --disable-verity --disable-verification flash vbmeta E:\s6ke\imgdata\vbmeta.img`
++   （必要时连 `vbmeta_system.img` 一起）。
++3. 回滚始终可用：`E:\s6ke\vendor\vendor.img`（未改动）+ `E:\s6ke\work\tools\restore_vendor.ps1`。
++
++## 不刷分区的替代方案（更稳，推荐）
++* 应用：`adb shell pm uninstall --user 0 <包名>` 逐个卸掉（只清 /data 里的副本，不动 vendor）。
++* 音频属性：做成一个 **KSU 模块**（开机 `post-fs-data.sh` 里 bind-mount 一份
++  `spkr_prot=false` 的 build.prop 覆盖 `/vendor/build.prop`），随时可禁用、无刷机风险。

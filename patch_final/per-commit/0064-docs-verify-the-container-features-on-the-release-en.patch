@@ -1,0 +1,49 @@
+From b3d8129fab944197623de28a57e0a0e31c3650ab Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 16:10:54 +0800
+Subject: [PATCH 64/67] docs: verify the container features on the release
+ (enforcing) image
+
+Both images now satisfy the Droidspaces v6.5.0 requirement check.  The release
+image runs with SELinux enforcing and KSU_DEBUG off, so adb shell itself cannot
+read dmesg or some sysctls there (klogctl: Permission denied) -- root contexts
+(adb shell su -c ...) can, which is what a container runtime uses.  Recorded the
+measured namespaces, SysV IPC / mqueue sysctls, a real devtmpfs mount and an
+unshare test in both images.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ EEBBK_S6_changes.md | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/EEBBK_S6_changes.md b/EEBBK_S6_changes.md
+index 3a80df143..776557d06 100755
+--- a/EEBBK_S6_changes.md
++++ b/EEBBK_S6_changes.md
+@@ -1079,3 +1079,26 @@ CONFIG_CGROUPS=y            CONFIG_MEMCG=y     CONFIG_SECCOMP=y
+   `ls /proc/sys/fs/mqueue` 非空（POSIX mqueue 生效）。
+ 
+ > 说明：Droidspaces 的 root 一项本来就是 ✓（说明 ReSukiSU 的 root 已经在真机上跑通了）。
++
++### 5. 两份镜像与实测结果（2026-09-19）
++
++| 镜像 | 配置差异 | 实测 |
++|---|---|---|
++| `dist/boot_container_debug.img`（18817404 B，md5 `111bdb921de68f6197945e52bdb28cf9`） | `BBK_DEBUG_BRINGUP=y`（SELinux Permissive + `/proc/eebbk_kmsg`）、`KSU_DEBUG=y`（`allow_shell=true`） | 全项 ✓，`adb shell su -c id` → `uid=0 context=u:r:ksu:s0` |
++| `dist/boot_container_release.img`（18817404 B，md5 `38f947ce2a1684d2fd23051304fd8aa1`） | 两者都关：**SELinux Enforcing**、无调试节点、`allow_shell=false` | 全项 ✓，见下 |
++
++release 版实测（`su -c` 下执行，即容器会走的上下文）：
++
++```
++/proc/self/ns/        cgroup ipc mnt net pid pid_for_children user uts
++/proc/sys/kernel/sem  → 32000 1024000000 500 32000        （SysV IPC 生效）
++/proc/sys/kernel/shmmax → 18446744073692774399
++/proc/sys/fs/mqueue   → msg_default msg_max msgsize_default msgsize_max queues_max
++mount -t devtmpfs devtmpfs /data/local/tmp/dt → MOUNT_UMOUNT_OK（能看到 adsprpc-smd 等设备节点）
++unshare -p -f -i -u -m id → uid=0(root) context=u:r:ksu:s0   （PID/IPC/UTS/MNT namespace 可建）
++lsmod wlan=1；霍尔 bbk_hall_data 可读；KernelSU: driver version 35144, Work mode: Built-in
++```
++
++**注意（Enforcing 的副作用，不是故障）**：release 版下 `adb shell` 自身被 ROM 策略限制，
++`dmesg`、`/proc/sys/kernel/sem`、部分厂商属性/`sysfs` 会读不到（`klogctl: Permission denied`）；
++要读就用 `adb shell su -c '...'`（root 上下文）。调试版因为 Permissive 所以 shell 直接可读。

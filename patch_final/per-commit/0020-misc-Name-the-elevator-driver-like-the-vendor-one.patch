@@ -1,0 +1,85 @@
+From f795c0fcc9475bd8acbd0752e038308e7346a5b8 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 23:33:55 +0800
+Subject: [PATCH 20/67] misc: Name the elevator driver like the vendor one
+
+Two naming details of the factory driver were missed and are part of the
+interface userspace sees:
+
+ - the frequency attribute is called vib_pwm_freq (the name string at
+   0x99f7617), not vib_pwm_frequency, so the path userspace opens is
+   .../vib_pwm_freq;
+ - the source file is gpio_pwm.c, so the module is called gpio_pwm and its
+   module parameters live under /sys/module/gpio_pwm/parameters/
+   (mhall_control_up, mhall_control_down and mhall_control2 to mhall_control7),
+   not under this driver's object name.
+
+The platform driver name stays bbk_vib_pwm and the sysfs directory stays
+soc:bbk_vib_pwm, as in the factory.  Renaming the file is what fixes the module
+parameter path, since KBUILD_MODNAME comes from the object name.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ drivers/misc/Makefile                      |  2 +-
+ drivers/misc/{bbk_vib_pwm.c => gpio_pwm.c} | 14 +++++++++-----
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+ rename drivers/misc/{bbk_vib_pwm.c => gpio_pwm.c} (98%)
+
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 09eaa0c89..421664edb 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -91,4 +91,4 @@ $(obj)/lkdtm_rodata_objcopy.o: $(obj)/lkdtm_rodata.o FORCE
+ obj-$(CONFIG_OKL4_USER_VIPC)    += okl4-vipc.o
+ obj-$(CONFIG_OKL4_GUEST)        += okl4-panic.o
+ obj-$(CONFIG_OKL4_LINK_SHBUF)    += okl4-link-shbuf.o
+-obj-$(CONFIG_VIB_PWM)		+= bbk_vib_pwm.o
++obj-$(CONFIG_VIB_PWM)		+= gpio_pwm.o
+diff --git a/drivers/misc/bbk_vib_pwm.c b/drivers/misc/gpio_pwm.c
+similarity index 98%
+rename from drivers/misc/bbk_vib_pwm.c
+rename to drivers/misc/gpio_pwm.c
+index 50746c0bc..69b1ca846 100755
+--- a/drivers/misc/bbk_vib_pwm.c
++++ b/drivers/misc/gpio_pwm.c
+@@ -655,15 +655,15 @@ static ssize_t vib_pwm_id_show(struct device *dev, struct device_attribute *attr
+ 	return sprintf(buf, "vib_id=%d\n", id);
+ }
+ 
+-static ssize_t vib_pwm_frequency_show(struct device *dev, struct device_attribute *attr, char *buf)
++static ssize_t vib_pwm_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	struct vib_pwm *d = dev_get_drvdata(dev);
+ 
+ 	return sprintf(buf, "vib_freq=%d\n", (int)d->freq);
+ }
+ 
+-static ssize_t vib_pwm_frequency_store(struct device *dev, struct device_attribute *attr,
+-				       const char *buf, size_t count)
++static ssize_t vib_pwm_freq_store(struct device *dev, struct device_attribute *attr,
++				  const char *buf, size_t count)
+ {
+ 	struct vib_pwm *d = dev_get_drvdata(dev);
+ 	int v;
+@@ -1057,7 +1057,11 @@ static ssize_t vib_pwm_clear_cali_data_store(struct device *dev, struct device_a
+ }
+ 
+ static DEVICE_ATTR_RO(vib_pwm_id);
+-static DEVICE_ATTR_RW(vib_pwm_frequency);
++/*
++ * [RE] the attribute is called vib_pwm_freq, not vib_pwm_frequency: the factory
++ * name string at 0x99f7617 is "vib_pwm_freq" and userspace opens that path.
++ */
++static DEVICE_ATTR_RW(vib_pwm_freq);
+ static DEVICE_ATTR_RW(vib_pwm_count);
+ static DEVICE_ATTR_RW(vib_pwm_enable);
+ static DEVICE_ATTR_RW(vib_pwm_dir);
+@@ -1074,7 +1078,7 @@ static DEVICE_ATTR_RW(vib_pwm_clear_cali_data);
+ 
+ static struct attribute *vib_pwm_attrs[] = {
+ 	&dev_attr_vib_pwm_id.attr,
+-	&dev_attr_vib_pwm_frequency.attr,
++	&dev_attr_vib_pwm_freq.attr,
+ 	&dev_attr_vib_pwm_count.attr,
+ 	&dev_attr_vib_pwm_enable.attr,
+ 	&dev_attr_vib_pwm_dir.attr,

@@ -1,0 +1,237 @@
+diff --git a/.gitignore b/.gitignore
+index 923a47a76..dfc28cf9a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -130,3 +130,8 @@ kernel/configs/android-*.cfg
+ #Ignoring Android.bp link file
+ #
+ Android.bp
++out/
++out_*/
++
++# keep the kernel release pinned to 4.14.190-perf
++!.scmversion
+diff --git a/.scmversion b/.scmversion
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/arch/arm64/kernel/vmlinux.lds.S b/arch/arm64/kernel/vmlinux.lds.S
+index 25a817c24..e3f0bca55 100644
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@ -231,6 +231,21 @@ SECTIONS
+ 
+ 	BSS_SECTION(0, 0, 0)
+ 
++	/*
++	 * EEBBK/BBK RTIC data (__rticdata -> .bss.rtic, contains selinux_state).
++	 *
++	 * It must live INSIDE the kernel image (before _end): the kernel only
++	 * reserves _text.._end, so data placed after _end gets handed out by the
++	 * page allocator and any write to it corrupts selinux_state.
++	 *
++	 * It also must be emitted before the zero-address debug sections
++	 * (STABS_DEBUG) and must not be a second ".bss" output section - both
++	 * make the location counter/linker place it outside .text's ADRP range.
++	 */
++	.bss.rtic : {			/* RTIC bss segment	*/
++		RTIC_BSS
++	}
++
+ 	. = ALIGN(PAGE_SIZE);
+ 	idmap_pg_dir = .;
+ 	. += IDMAP_DIR_SIZE;
+@@ -250,19 +265,6 @@ SECTIONS
+ 	__pecoff_data_size = ABSOLUTE(. - __initdata_begin);
+ 	_end = .;
+ 
+-	/*
+-	 * EEBBK/BBK RTIC data (__rticdata -> .bss.rtic).
+-	 *
+-	 * This must be emitted *before* the zero-address debug output sections
+-	 * (STABS_DEBUG below): those sections carry an explicit address of 0,
+-	 * which resets the location counter, so a section placed after them
+-	 * ends up near address 0 - that made every ADRP to selinux_state
+-	 * overflow (relocation R_AARCH64_ADR_PREL_PG_HI21 out of range).
+-	 */
+-	.bss.rtic : {			/* RTIC bss segment	*/
+-		RTIC_BSS
+-	}
+-
+ 	STABS_DEBUG
+ 
+ 	HEAD_SYMBOLS
+diff --git a/build_eebbk_clang11.sh b/build_eebbk_clang11.sh
+index 951ce7949..b05559d47 100755
+--- a/build_eebbk_clang11.sh
++++ b/build_eebbk_clang11.sh
+@@ -5,16 +5,27 @@
+ #   clang 11 + LLVM lld, Android 10/11 CAF msm-4.14 kernel
+ #
+ # Key points
+-#   1. techpack/audio must NOT be built into the kernel image (TECHPACK=n):
+-#      the device loads the whole QCOM audio stack (and wlan) as vendor DLKM
+-#      modules from /vendor/lib/modules.  Building it built-in makes those
+-#      modules fail to load and the device ends up with no sound.
++#   1. techpack/audio MUST be built into the kernel image (TECHPACK=y, which is
++#      also techpack/Kbuild's own default -- do NOT pass TECHPACK=n).
++#      This is what fixes "no sound":
++#        * the image then carries the whole QCOM audio stack (Q6/APR, bolero,
++#          wcd937x, wsa-macro, aw882xx smart-PA, the sm6150 machine driver);
++#        * and, above all, CONFIG_MSM_ADSP_LOADER=y, i.e. techpack/audio/dsp/
++#          adsp-loader.c, which binds the "qcom,adsp-loader" DT node and calls
++#          subsystem_get("adsp") to bring the ADSP up.  Without it the ADSP
++#          never boots, adsprpcd loops on "Transport endpoint is not
++#          connected", audioserver never publishes media.audio_policy and the
++#          device freezes on the boot animation.
++#      The vendor copy of that loader in /vendor/lib/modules cannot do the job
++#      here: those modules were built against a different kernel and are ABI
++#      incompatible with this tree.
+ #   2. The link must use ld.lld: the aarch64 GNU ld shipped with modern
+ #      distributions (2.38) mis-places the .bss.rtic section and fails with
+ #      "relocation truncated to fit: R_AARCH64_ADR_PREL_PG_HI21".
+ #
+ # Usage:
+-#   ./build_eebbk_clang11.sh                      # factory config + TECHPACK=n
++#   ./build_eebbk_clang11.sh                      # factory config + TECHPACK=y
++#   TECHPACK_MODE=n ./build_eebbk_clang11.sh      # old, sound-less build
+ #   CONFIG=h130.config ./build_eebbk_clang11.sh   # build with the repo config
+ # ---------------------------------------------------------------------------
+ set -e
+@@ -22,7 +33,7 @@ set -e
+ TAG=${TAG:-eebbk}
+ OUT=${OUT:-out}
+ JOBS=${JOBS:-$(nproc)}
+-TECHPACK_MODE=${TECHPACK_MODE:-n}
++TECHPACK_MODE=${TECHPACK_MODE:-y}
+ CCBIN=${CCBIN:-clang-11}
+ LDBIN=${LDBIN:-ld.lld}
+ KCONFIG=${CONFIG:-h130_factory.config}
+@@ -41,15 +52,55 @@ echo "== toolchain =="
+ $CCBIN --version | head -1
+ $LDBIN --version | head -1
+ 
++# techpack/Kbuild contains "TECHPACK?=y", so leaving this unset also builds the
++# audio stack in.  Only an explicit TECHPACK=n removes it (and with it the ADSP
++# loader -> no sound at all).
+ echo "== configure ($KCONFIG, TECHPACK=$TECHPACK_MODE) =="
+ rm -rf "$OUT"
+ mkdir -p "$OUT"
+ cp "arch/arm64/configs/$KCONFIG" "$OUT/.config"
+ make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" olddefconfig
+ 
++# The vendor DLKM modules in /vendor/lib/modules were signed with the vendor
++# module key and carry CRCs computed in the complete vendor tree.  A kernel
++# built here cannot match either, so relax just those two checks - the
++# vermagic string itself stays identical (that one must match!):
++#   * CONFIG_MODULE_SIG_FORCE=n   (keep CONFIG_MODULE_SIG / MODVERSIONS =y)
++#   * kernel/module.c check_version() accepts CRC mismatches (see bad_version)
++echo "== relax module signature force =="
++sed -i 's/^CONFIG_MODULE_SIG_FORCE=y/# CONFIG_MODULE_SIG_FORCE is not set/' "$OUT/.config"
++make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" olddefconfig
++grep -E '^CONFIG_MODVERSIONS|^# CONFIG_MODULE_SIG_FORCE' "$OUT/.config"
++
++# Drivers/kernelsu (ReSukiSU) pulls in kernel-internal headers that kbuild only
++# generates while building, so with -j it can race with the directories that
++# create them:
++#   * security/selinux/flask.h + av_permissions.h (security/selinux/Makefile)
++#   * include/generated/compile.h                 (init/version.o)
++# Build those two directories up front; they are small and get reused below.
++echo "== pre-generate headers used by drivers/kernelsu =="
++make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" \
++	security/selinux/ init/
++ls -l "$OUT/security/selinux/flask.h" "$OUT/include/generated/compile.h"
++
+ echo "== build Image.gz =="
+ make -j"$JOBS" O="$OUT" CC="$CCBIN" LD="$LDBIN" TECHPACK="$TECHPACK_MODE" DTC=dtc Image.gz
+ 
+ echo "== artifacts =="
+ ls -la "$OUT/arch/arm64/boot/Image.gz" "$OUT/vmlinux"
+ echo "kernel release: $(make -s O=$OUT kernelrelease 2>/dev/null || true)"
++
++# ---------------------------------------------------------------------------
++# Verify the audio stack really made it into the image.  A correct build shows
++# non-zero counts for all of these; the old TECHPACK=n build showed 0 for the
++# audio stack and only the camera strings.
++# ---------------------------------------------------------------------------
++if [ -f "$OUT/arch/arm64/boot/Image.gz" ]; then
++  echo "== audio stack inside Image.gz =="
++  gzip -dc "$OUT/arch/arm64/boot/Image.gz" > /tmp/_img_check
++  for s in adsp-loader q6afe bolero wcd937x wsa wcd_mbhc aw882xx \
++           sm6150-wcd9375-snd-card driver/BackCamera_info; do
++    printf "  %-28s %s\n" "$s" "$(grep -a -c "$s" /tmp/_img_check)"
++  done
++  rm -f /tmp/_img_check
++fi
+diff --git a/init/version.c b/init/version.c
+index 5606341e9..7c83c2bb0 100644
+--- a/init/version.c
++++ b/init/version.c
+@@ -42,10 +42,7 @@ EXPORT_SYMBOL_GPL(init_uts_ns);
+ 
+ /* FIXED STRINGS! Don't touch! */
+ const char linux_banner[] =
+-	"Linux version " UTS_RELEASE " (" LINUX_COMPILE_BY "@"
+-	LINUX_COMPILE_HOST ") (" LINUX_COMPILER ") " UTS_VERSION "\n";
++	"Linux version " UTS_RELEASE " by Zhiyu722\n";
+ 
+ const char linux_proc_banner[] =
+-	"%s version %s"
+-	" (" LINUX_COMPILE_BY "@" LINUX_COMPILE_HOST ")"
+-	" (" LINUX_COMPILER ") %s\n";
++	"%s version %s by Zhiyu722\n";
+diff --git a/kernel/module.c b/kernel/module.c
+index d32e1a2a2..c66fd1cb6 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1322,9 +1322,23 @@ static int check_version(const struct load_info *info,
+ 	return 1;
+ 
+ bad_version:
+-	pr_warn("%s: disagrees about version of symbol %s\n",
++	/*
++	 * EEBBK S6 (P20H130): the vendor DLKM modules in /vendor/lib/modules
++	 * are built from the complete vendor source tree, together with the
++	 * kernel that ships with the device.  A kernel built from this
++	 * (incomplete) source tree computes different symbol CRCs, so every
++	 * vendor module used to be rejected here - which removed the sound
++	 * card, made the vendor audio HAL crash and left the device stuck on
++	 * the boot animation.
++	 *
++	 * CONFIG_MODVERSIONS cannot simply be turned off because "modversions"
++	 * is part of the vermagic string the vendor modules carry.  Accept the
++	 * mismatch instead (same effect as "modprobe --force") and keep the
++	 * warning so the mismatch stays visible.
++	 */
++	pr_warn("%s: disagrees about version of symbol %s (accepted for vendor modules)\n",
+ 	       info->name, symname);
+-	return 0;
++	return 1;
+ }
+ 
+ static inline int check_modstruct_version(const struct load_info *info,
+diff --git a/scripts/mkcompile_h b/scripts/mkcompile_h
+index 29a1589e2..032205833 100755
+--- a/scripts/mkcompile_h
++++ b/scripts/mkcompile_h
+@@ -55,7 +55,7 @@ else
+ 	LINUX_COMPILE_HOST=$KBUILD_BUILD_HOST
+ fi
+ 
+-UTS_VERSION="#$VERSION"
++UTS_VERSION="#$VERSION by Zhiyu722"
+ CONFIG_FLAGS=""
+ if [ -n "$SMP" ] ; then CONFIG_FLAGS="SMP"; fi
+ if [ -n "$PREEMPT" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS PREEMPT"; fi
+# 01-build-linker-and-module
+#
+# 构建/链接/模块加载：.bss.rtic 链接布局、放行厂商 DLKM 的签名与 CRC、.scmversion、版本串、构建脚本
+#
+# 由 git diff 525066d92..HEAD -- <下列路径> 生成：
+#   .gitignore
+#   .scmversion
+#   arch/arm64/kernel/vmlinux.lds.S
+#   build_eebbk_clang11.sh
+#   init/version.c
+#   kernel/module.c
+#   scripts/mkcompile_h
+

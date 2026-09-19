@@ -1,0 +1,87 @@
+From e88e623ada30b3ab51762d11842bb088a39d75d4 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 18:01:42 +0800
+Subject: [PATCH 47/67] ASoC: aw882xx: Load the ROM's register tables as the
+ amplifier profile
+
+The vendor's tables are plain 16 bit address/value pairs, which is exactly what
+aw_dev_parse_raw_reg() stores and aw_dev_reg_fw_update() programs into the chip.
+Add aw_dev_load_reg_table() to install one of them as profile 0 and pick it by
+i2c address (0x34 speaker, 0x36 receiver, matching AW882XX_SPEAKER_NAME and
+AW882XX_RECEIVER_NAME), falling back to an absolute /vendor/firmware path when
+the plain name does not resolve.
+
+This restores the board specific values instead of the generic defaults - most
+visibly I2SCTRL 0x06 with the left channel bit (0x18e8 against the driver's
+0x14e8, the channel aw_device_parse_dt() defaults to when the device tree has no
+sound-channel property, which is the case here).
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ .../audio/asoc/codecs/awinic/inc/aw_device.h  |  1 +
+ .../audio/asoc/codecs/awinic/src/aw_device.c  | 40 +++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/techpack/audio/asoc/codecs/awinic/inc/aw_device.h b/techpack/audio/asoc/codecs/awinic/inc/aw_device.h
+index 5cffa24dc..8f278c598 100755
+--- a/techpack/audio/asoc/codecs/awinic/inc/aw_device.h
++++ b/techpack/audio/asoc/codecs/awinic/inc/aw_device.h
+@@ -192,6 +192,7 @@ int aw_device_init(struct aw_device *aw_dev, struct aw_container *aw_cfg);
+ int aw_device_start(struct aw_device *aw_dev);
+ int aw_device_stop(struct aw_device *aw_dev);
+ int aw_dev_fw_update(struct aw_device *aw_dev,  bool prof_sw);
++int aw_dev_load_reg_table(struct aw_device *aw_dev, uint8_t *data, uint32_t len);
+ 
+ //profile
+ int aw_dev_prof_update(struct aw_device *aw_dev);
+diff --git a/techpack/audio/asoc/codecs/awinic/src/aw_device.c b/techpack/audio/asoc/codecs/awinic/src/aw_device.c
+index 64d639a51..ba4615a4d 100755
+--- a/techpack/audio/asoc/codecs/awinic/src/aw_device.c
++++ b/techpack/audio/asoc/codecs/awinic/src/aw_device.c
+@@ -165,6 +165,46 @@ static int aw_dev_parse_raw_reg(struct aw_device *aw_dev,
+ 	return 0;
+ }
+ 
++/*
++ * EEBBK S6 (P20H130): this ROM ships no acf file, only the older AWINIC raw
++ * register tables (aw882xx_spk_reg_l.bin and friends in /vendor/firmware).  A
++ * bare list of 16 bit register addresses and values is exactly the format
++ * aw_dev_parse_raw_reg() stores and aw_dev_reg_fw_update() programs into the
++ * chip, so such a table can be installed as profile 0 ("Music") and applied by
++ * the normal start path.  That restores the vendor settings - among them
++ * I2SCTRL 0x06 with the channel bit (0x18e8 for the left part against the
++ * generic 0x14e8 the driver would otherwise use) - which is what the
++ * amplifiers need to produce sound on this board.
++ */
++int aw_dev_load_reg_table(struct aw_device *aw_dev, uint8_t *data, uint32_t len)
++{
++	struct aw_prof_desc *prof_desc;
++
++	if (aw_dev == NULL || data == NULL || len < 4)
++		return -EINVAL;
++
++	if (aw_dev->prof_info.prof_desc == NULL) {
++		aw_dev->prof_info.prof_desc =
++			kzalloc(sizeof(struct aw_prof_desc) * AW_PROFILE_MAX,
++				GFP_KERNEL);
++		if (aw_dev->prof_info.prof_desc == NULL)
++			return -ENOMEM;
++	}
++
++	prof_desc = &aw_dev->prof_info.prof_desc[0];
++	memset(prof_desc, 0, sizeof(*prof_desc));
++
++	if (aw_dev_parse_raw_reg(aw_dev, data, len, prof_desc))
++		return -EINVAL;
++
++	prof_desc->id = 0;			/* "Music" */
++	aw_dev->prof_info.count = 1;
++	aw_dev->set_prof = 0;
++	aw_dev->cur_prof = -1;			/* force a register update */
++
++	return 0;
++}
++
+ static int aw_dev_parse_raw_dsp(struct aw_device *aw_dev,
+ 			uint8_t *data, uint32_t data_len, struct aw_prof_desc *prof_desc)
+ {

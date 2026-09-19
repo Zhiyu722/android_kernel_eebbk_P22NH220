@@ -1,0 +1,52 @@
+From 9d2889df65167a31a39a714c3f54e1a45bc1fe5e Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 18:01:42 +0800
+Subject: [PATCH 44/67] ASoC: msm-dai-q6: Accept 32 bit samples on the MI2S
+ backend
+
+The ROM's audio HAL drives the speaker through the tertiary MI2S port with 32
+bit samples: it writes 32 to the backend's BitWidth mixer control and opens the
+PCM with SNDRV_PCM_FORMAT_S32_LE, which is format 10 in the kernel log.  The
+version of msm_dai_q6_mi2s_hw_params() in this tree only handles S16_LE,
+SPECIAL, S24_LE and S24_3LE, so every playback failed with
+
+    msm_dai_q6_mi2s_hw_params: format 10
+    ASoC: can't set Tertiary MI2S hw params: -22
+     TERT_MI2S_RX: ASoC: hw_params BE failed -22
+     SM6150 LowLatency: ASoC: hw_params BE failed -22
+
+and the speaker stayed silent even though the card, the route and the ACDB
+calibration were all applied.  The vendor's own build of this driver - pulled
+from the device as audio_platform.ko - writes bit_width = 32, so the 32 bit case
+is restored here to match it.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ techpack/audio/asoc/msm-dai-q6-v2.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/techpack/audio/asoc/msm-dai-q6-v2.c b/techpack/audio/asoc/msm-dai-q6-v2.c
+index 76dba8f22..0454958ba 100755
+--- a/techpack/audio/asoc/msm-dai-q6-v2.c
++++ b/techpack/audio/asoc/msm-dai-q6-v2.c
+@@ -5239,6 +5239,20 @@ static int msm_dai_q6_mi2s_hw_params(struct snd_pcm_substream *substream,
+ 		dai_data->port_config.i2s.bit_width = 24;
+ 		dai_data->bitwidth = 24;
+ 		break;
++	/*
++	 * EEBBK S6 (P20H130): the ROM's audio HAL drives the speaker path -
++	 * Tertiary MI2S into the two AW882xx amplifiers - with 32 bit samples
++	 * (it writes 32 to the BitWidth mixer control and opens the PCM with
++	 * SNDRV_PCM_FORMAT_S32_LE, which is format 10 in the kernel log).
++	 * Without this case every playback of that route fails with
++	 * "can't set Tertiary MI2S hw params: -22" and the speaker stays
++	 * silent.  The vendor's own build of this driver accepts it and
++	 * programs bit_width = 32, which is what the AFE interface allows.
++	 */
++	case SNDRV_PCM_FORMAT_S32_LE:
++		dai_data->port_config.i2s.bit_width = 32;
++		dai_data->bitwidth = 32;
++		break;
+ 	default:
+ 		pr_err("%s: format %d\n",
+ 			__func__, params_format(params));

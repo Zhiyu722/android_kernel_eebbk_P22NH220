@@ -1,0 +1,373 @@
+diff --git a/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_l.bin b/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_l.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..6464c45502943d1be1dcc5a95fd4a7dc5b0a92d1
+GIT binary patch
+literal 148
+zcmV~$y$-=p0D#f2KeY7H1&OU)SUXxI9Xx<25*B|&vFK=$GzO1xM{l8t#BP&Vj7%P(
+z&e6F3bka_aFL^!{gIF^$-2$dj#KYpP2trD{WSLsihKYkh3!g5D+T-p7__9wu8}MYv
+t#Tg+OgFD3%GY;CEhrYmWgxso2lJ*MYxJD&H^)^U-OC)!k&U?sWQvP%7AG`nn
+
+literal 0
+HcmV?d00001
+
+diff --git a/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_r.bin b/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_r.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..1a2f45b1dd1bc20e0d36178f730f0ad80ea11f57
+GIT binary patch
+literal 148
+zcmV~$yAHun0D$4Y7g}065w_EXwWCGShzF3mBrI-4u@I9<(il9(c@s?}cALavWbz30
+zeHz!FPSVcsCCjH`aL`OlH-~BD@vwL+HX#LGvPik^z*wNrz^6m32HZs#U-qb`eVz<x
+ti6J&4a3@&yl%qD|q0ez@A-B?kxVgkQtx$<jy){zb5Xmj)%MQ{#34dI;A6x(c
+
+literal 0
+HcmV?d00001
+
+diff --git a/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_l.bin b/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_l.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..f026ba720938c411eebc0af0d87ff8723f415281
+GIT binary patch
+literal 148
+zcmV~$yAHu%0D#f27g}065w><AwvG&v4j!O!OIVZ^#iFB0(il9(KY9xiiQOi#7;PS*
+z&QZAjRJ>k}7J0rkjYQGWodRB`h>O8TGKnbh7G<hU3uZPFZ328!xzEEM;E5siY{ZK(
+u7kh%q6r2FVoO1{lJk=1Z5pl09NxLhw;~JS5+1()2EwR{fI`1J%xbX)Uavy2{
+
+literal 0
+HcmV?d00001
+
+diff --git a/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_r.bin b/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_r.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..ffd775d15b419d7c63cfb66442bdb9f6daa5267a
+GIT binary patch
+literal 148
+zcmV~$yAHu%0D#f27g}1nAhERzv2|pSG|~qUw}eG$Q7pt{k~9X7@xKX)#BP&Vj5d!@
+z=O|o%DxROAL6&bx<Dls1P7be?$Hm|ynM4$Liz1b}1ydV|CIMX%xyQrq<B0*)bjXVl
+u9ea$)1e^fFoN)~2Jk=1Z7I7~xNZL!Z(+Zgw*<B;l4YAmAzU&~~bK?*E2Ok0e
+
+literal 0
+HcmV?d00001
+
+diff --git a/techpack/audio/asoc/codecs/awinic/inc/aw_device.h b/techpack/audio/asoc/codecs/awinic/inc/aw_device.h
+index 5cffa24dc..8f278c598 100755
+--- a/techpack/audio/asoc/codecs/awinic/inc/aw_device.h
++++ b/techpack/audio/asoc/codecs/awinic/inc/aw_device.h
+@@ -192,6 +192,7 @@ int aw_device_init(struct aw_device *aw_dev, struct aw_container *aw_cfg);
+ int aw_device_start(struct aw_device *aw_dev);
+ int aw_device_stop(struct aw_device *aw_dev);
+ int aw_dev_fw_update(struct aw_device *aw_dev,  bool prof_sw);
++int aw_dev_load_reg_table(struct aw_device *aw_dev, uint8_t *data, uint32_t len);
+ 
+ //profile
+ int aw_dev_prof_update(struct aw_device *aw_dev);
+diff --git a/techpack/audio/asoc/codecs/awinic/src/aw882xx.c b/techpack/audio/asoc/codecs/awinic/src/aw882xx.c
+index 9551436d4..9ac512b75 100755
+--- a/techpack/audio/asoc/codecs/awinic/src/aw882xx.c
++++ b/techpack/audio/asoc/codecs/awinic/src/aw882xx.c
+@@ -615,7 +615,68 @@ static void aw882xx_firmware_acf_loaded(const struct firmware *cont, void *conte
+ 	aw882xx->fw_status = AW_DEV_FW_FAILED;
+ 	if (!cont) {
+ 		aw_dev_err(aw882xx->dev, "load [%s] failed!", aw882xx->aw_pa->acf_name);
+-		return;
++		/*
++		 * EEBBK S6 (P20H130): this ROM ships no acf file.  Its
++		 * /vendor/firmware only carries the older AWINIC register
++		 * tables aw882xx_spk_reg_l.bin, aw882xx_spk_reg_r.bin,
++		 * aw882xx_rcv_reg_l.bin and aw882xx_rcv_reg_r.bin, which is
++		 * the scheme the vendor's shipped audio_aw882xx.ko uses.
++		 *
++		 * Without the acf the driver used to leave fw_status FAILED,
++		 * and aw882xx_start() then refused to power the amplifier up
++		 * ("fw_load failed ,can not start PA"), leaving SYSCTRL 0x04
++		 * at 0x4003 - PWDN and AMPPD set - through every playback, so
++		 * the speaker stayed silent even though the PCM started
++		 * cleanly.  Carry on with the driver's own default
++		 * initialisation: aw_dev_reg_fw_update() and
++		 * aw_dev_dsp_fw_update() both return early when there is no
++		 * profile, and aw882xx_start() ignores their return value.
++		 * The tuning itself should come from the ROM's register tables
++		 * through aw_dev_parse_reg_bin_with_hdr().
++		 */
++		{
++			const struct firmware *reg_fw = NULL;
++			const char *reg_name;
++			int addr = aw882xx->i2c->addr;
++
++			/*
++			 * 0x34 is the speaker part, 0x36 the receiver one
++			 * (see AW882XX_SPEAKER_NAME / AW882XX_RECEIVER_NAME in
++			 * the machine driver).  Try both the plain name, which
++			 * ueventd resolves in /vendor/firmware, and the absolute
++			 * path.
++			 */
++			reg_name = (addr == 0x36) ?
++				"aw882xx_rcv_reg_l.bin" : "aw882xx_spk_reg_l.bin";
++			if (request_firmware(&reg_fw, reg_name, aw882xx->dev) != 0)
++				reg_fw = NULL;
++
++			if (reg_fw == NULL &&
++			    request_firmware(&reg_fw,
++					     (addr == 0x36) ?
++					     "/vendor/firmware/aw882xx_rcv_reg_l.bin" :
++					     "/vendor/firmware/aw882xx_spk_reg_l.bin",
++					     aw882xx->dev) != 0)
++				reg_fw = NULL;
++
++			if (reg_fw != NULL &&
++			    aw_dev_load_reg_table(aw882xx->aw_pa,
++						  (uint8_t *)reg_fw->data,
++						  reg_fw->size) == 0) {
++				aw_dev_err(aw882xx->dev,
++					   "no acf on this ROM, loaded the vendor table [%s] (%zu bytes)\n",
++					   reg_name, reg_fw->size);
++				aw882xx->fw_status = AW_DEV_FW_OK;
++				release_firmware(reg_fw);
++				return;
++			}
++			if (reg_fw)
++				release_firmware(reg_fw);
++			aw_dev_err(aw882xx->dev,
++				   "no acf and no register table, starting the PA with defaults\n");
++			aw882xx->fw_status = AW_DEV_FW_OK;
++			return;
++		}
+ 	}
+ 
+ 	aw_dev_info(aw882xx->dev, "load [%s] , file size: [%zu]",
+diff --git a/techpack/audio/asoc/codecs/awinic/src/aw_device.c b/techpack/audio/asoc/codecs/awinic/src/aw_device.c
+index 64d639a51..ba4615a4d 100755
+--- a/techpack/audio/asoc/codecs/awinic/src/aw_device.c
++++ b/techpack/audio/asoc/codecs/awinic/src/aw_device.c
+@@ -165,6 +165,46 @@ static int aw_dev_parse_raw_reg(struct aw_device *aw_dev,
+ 	return 0;
+ }
+ 
++/*
++ * EEBBK S6 (P20H130): this ROM ships no acf file, only the older AWINIC raw
++ * register tables (aw882xx_spk_reg_l.bin and friends in /vendor/firmware).  A
++ * bare list of 16 bit register addresses and values is exactly the format
++ * aw_dev_parse_raw_reg() stores and aw_dev_reg_fw_update() programs into the
++ * chip, so such a table can be installed as profile 0 ("Music") and applied by
++ * the normal start path.  That restores the vendor settings - among them
++ * I2SCTRL 0x06 with the channel bit (0x18e8 for the left part against the
++ * generic 0x14e8 the driver would otherwise use) - which is what the
++ * amplifiers need to produce sound on this board.
++ */
++int aw_dev_load_reg_table(struct aw_device *aw_dev, uint8_t *data, uint32_t len)
++{
++	struct aw_prof_desc *prof_desc;
++
++	if (aw_dev == NULL || data == NULL || len < 4)
++		return -EINVAL;
++
++	if (aw_dev->prof_info.prof_desc == NULL) {
++		aw_dev->prof_info.prof_desc =
++			kzalloc(sizeof(struct aw_prof_desc) * AW_PROFILE_MAX,
++				GFP_KERNEL);
++		if (aw_dev->prof_info.prof_desc == NULL)
++			return -ENOMEM;
++	}
++
++	prof_desc = &aw_dev->prof_info.prof_desc[0];
++	memset(prof_desc, 0, sizeof(*prof_desc));
++
++	if (aw_dev_parse_raw_reg(aw_dev, data, len, prof_desc))
++		return -EINVAL;
++
++	prof_desc->id = 0;			/* "Music" */
++	aw_dev->prof_info.count = 1;
++	aw_dev->set_prof = 0;
++	aw_dev->cur_prof = -1;			/* force a register update */
++
++	return 0;
++}
++
+ static int aw_dev_parse_raw_dsp(struct aw_device *aw_dev,
+ 			uint8_t *data, uint32_t data_len, struct aw_prof_desc *prof_desc)
+ {
+diff --git a/techpack/audio/asoc/msm-dai-q6-v2.c b/techpack/audio/asoc/msm-dai-q6-v2.c
+index 76dba8f22..0454958ba 100755
+--- a/techpack/audio/asoc/msm-dai-q6-v2.c
++++ b/techpack/audio/asoc/msm-dai-q6-v2.c
+@@ -5239,6 +5239,20 @@ static int msm_dai_q6_mi2s_hw_params(struct snd_pcm_substream *substream,
+ 		dai_data->port_config.i2s.bit_width = 24;
+ 		dai_data->bitwidth = 24;
+ 		break;
++	/*
++	 * EEBBK S6 (P20H130): the ROM's audio HAL drives the speaker path -
++	 * Tertiary MI2S into the two AW882xx amplifiers - with 32 bit samples
++	 * (it writes 32 to the BitWidth mixer control and opens the PCM with
++	 * SNDRV_PCM_FORMAT_S32_LE, which is format 10 in the kernel log).
++	 * Without this case every playback of that route fails with
++	 * "can't set Tertiary MI2S hw params: -22" and the speaker stays
++	 * silent.  The vendor's own build of this driver accepts it and
++	 * programs bit_width = 32, which is what the AFE interface allows.
++	 */
++	case SNDRV_PCM_FORMAT_S32_LE:
++		dai_data->port_config.i2s.bit_width = 32;
++		dai_data->bitwidth = 32;
++		break;
+ 	default:
+ 		pr_err("%s: format %d\n",
+ 			__func__, params_format(params));
+diff --git a/techpack/audio/asoc/msm-pcm-routing-v2.c b/techpack/audio/asoc/msm-pcm-routing-v2.c
+index 298f8a19f..a6d295dc0 100755
+--- a/techpack/audio/asoc/msm-pcm-routing-v2.c
++++ b/techpack/audio/asoc/msm-pcm-routing-v2.c
+@@ -18638,6 +18638,26 @@ static const int wsa_rx_0_vi_fb_tx_rch_value[] = {
+ };
+ 
+ 
++/*
++ * EEBBK S6 (P20H130): the ROM drives the speaker, and reads the AW882xx feedback,
++ * on the tertiary MI2S, so the VI feedback mux has to exist for that port too -
++ * the vendor's audio_platform.ko has it and its mixer paths write
++ * "TERT_MI2S_RX_VI_FB_MUX".  This tree only carried the primary MI2S version and
++ * its AW882xx route pointed at QUAT_MI2S_RX_VI_FB_MUX, which is not defined here.
++ */
++static const char * const tert_mi2s_rx_vi_fb_tx_mux_text[] = {
++	"ZERO", "TERT_MI2S_TX"
++};
++
++static const int tert_mi2s_rx_vi_fb_tx_value[] = {
++	MSM_BACKEND_DAI_MAX, MSM_BACKEND_DAI_TERTIARY_MI2S_TX
++};
++
++static const struct soc_enum tert_mi2s_rx_vi_fb_mux_enum =
++	SOC_VALUE_ENUM_DOUBLE(SND_SOC_NOPM, MSM_BACKEND_DAI_TERTIARY_MI2S_RX, 0, 0,
++	ARRAY_SIZE(tert_mi2s_rx_vi_fb_tx_mux_text),
++	tert_mi2s_rx_vi_fb_tx_mux_text, tert_mi2s_rx_vi_fb_tx_value);
++
+ static const int mi2s_rx_vi_fb_tx_value[] = {
+ #ifdef CONFIG_SND_SOC_TFA9874_FOR_DAVI
+ 	MSM_BACKEND_DAI_MAX, PLATFORM_RX_VI_FB_TX_VALUE
+@@ -18726,6 +18746,11 @@ static const struct snd_kcontrol_new mi2s_rx_vi_fb_mux =
+ 	mi2s_rx_vi_fb_mux_enum, spkr_prot_get_vi_lch_port,
+ 	spkr_prot_put_vi_lch_port);
+ 
++static const struct snd_kcontrol_new tert_mi2s_rx_vi_fb_mux =
++	SOC_DAPM_ENUM_EXT("TERT_MI2S_RX_VI_FB_MUX",
++	tert_mi2s_rx_vi_fb_mux_enum, spkr_prot_get_vi_lch_port,
++	spkr_prot_put_vi_lch_port);
++
+ static const struct snd_kcontrol_new int4_mi2s_rx_vi_fb_mono_ch_mux =
+ 	SOC_DAPM_ENUM_EXT("INT4_MI2S_RX_VI_FB_MONO_CH_MUX",
+ 	int4_mi2s_rx_vi_fb_mono_ch_mux_enum, spkr_prot_get_vi_lch_port,
+@@ -19644,6 +19669,8 @@ static const struct snd_soc_dapm_widget msm_qdsp6_widgets_mi2s[] = {
+ 	SND_SOC_DAPM_MUX("PRI_MI2S_RX_VI_FB_MUX", SND_SOC_NOPM, 0, 0,
+ #endif
+ 				&mi2s_rx_vi_fb_mux),
++	SND_SOC_DAPM_MUX("TERT_MI2S_RX_VI_FB_MUX", SND_SOC_NOPM, 0, 0,
++				&tert_mi2s_rx_vi_fb_mux),
+ 	SND_SOC_DAPM_MUX("INT4_MI2S_RX_VI_FB_MONO_CH_MUX", SND_SOC_NOPM, 0, 0,
+ 				&int4_mi2s_rx_vi_fb_mono_ch_mux),
+ 	SND_SOC_DAPM_MUX("INT4_MI2S_RX_VI_FB_STEREO_CH_MUX", SND_SOC_NOPM, 0, 0,
+@@ -23810,6 +23837,7 @@ static const struct snd_soc_dapm_route intercon_mi2s[] = {
+ 	{PLATFORM_RX_VI_FB_MUX_NAME, PLATFORM_RX_VI_FB_TX_MUX_TEXT, PLATFORM_RX_VI_FB_TX_MUX_TEXT},
+ #elif defined(CONFIG_SND_SOC_AWINIC_AW882XX)
+ 	{"PRI_MI2S_RX_VI_FB_MUX", "PRI_MI2S_TX", "PRI_MI2S_TX"},
++	{"TERT_MI2S_RX_VI_FB_MUX", "TERT_MI2S_TX", "TERT_MI2S_TX"},
+ #else
+ 	{"PRI_MI2S_RX_VI_FB_MUX", "SENARY_TX", "SENARY_TX"},
+ #endif
+@@ -23819,6 +23847,7 @@ static const struct snd_soc_dapm_route intercon_mi2s[] = {
+ 	{PLATFORM_RX_VI_FB_RX_MUX_TEXT, NULL, PLATFORM_RX_VI_FB_MUX_NAME},
+ #else
+ 	{"PRI_MI2S_RX", NULL, "PRI_MI2S_RX_VI_FB_MUX"},
++	{"TERT_MI2S_RX", NULL, "TERT_MI2S_RX_VI_FB_MUX"},
+ #endif
+ #ifdef CONFIG_SND_SOC_AWINIC_AW882XX
+ 	{"QUAT_MI2S_RX", NULL, "QUAT_MI2S_RX_VI_FB_MUX"},
+diff --git a/techpack/audio/asoc/sm6150.c b/techpack/audio/asoc/sm6150.c
+index 40c031fab..dcdbe7734 100755
+--- a/techpack/audio/asoc/sm6150.c
++++ b/techpack/audio/asoc/sm6150.c
+@@ -7784,8 +7784,25 @@ static struct snd_soc_dai_link msm_mi2s_be_dai_links[] = {
+ 		.stream_name = "Tertiary MI2S Playback",
+ 		.cpu_dai_name = "msm-dai-q6-mi2s.2",
+ 		.platform_name = "msm-pcm-routing",
++#ifdef CONFIG_SND_SOC_AWINIC_AW882XX
++		/*
++		 * EEBBK S6 (P20H130): the speaker is driven by the two AWINIC
++		 * AW882xx amplifiers on the tertiary MI2S port.  The ROM's
++		 * mixer paths route speaker playback with
++		 * "TERT_MI2S_RX Audio Mixer MultiMedia5" and its HAL registers
++		 * the speaker device on this backend, but this table used to
++		 * name msm-stub-codec.1 here.  A stub has no DAI events, so
++		 * the amplifiers were never taken out of power down: reading
++		 * the chip showed SYSCTRL (0x04) stuck at 0x4003 - PWDN and
++		 * AMPPD set - through every playback, and the speaker stayed
++		 * silent even after the PCM started without error.
++		 */
++		.num_codecs = ARRAY_SIZE(awinic_codecs),
++		.codecs = awinic_codecs,
++#else
+ 		.codec_name = "msm-stub-codec.1",
+ 		.codec_dai_name = "msm-stub-rx",
++#endif
+ 		.no_pcm = 1,
+ 		.dpcm_playback = 1,
+ 		.id = MSM_BACKEND_DAI_TERTIARY_MI2S_RX,
+@@ -8555,16 +8572,38 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev)
+ 				__func__);
+ 		} else {
+ 			if (mi2s_audio_intf) {
+-
+-    // 第一个 link（通常是左声道）
+-                msm_mi2s_be_dai_links[0].codec_name = "tfa98xx.2-0034";
+-                msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-2-34";
+-
+-                // 第二个 link（右声道）
+-                msm_mi2s_be_dai_links[1].codec_name = "tfa98xx.2-0036";
+-                msm_mi2s_be_dai_links[1].codec_dai_name = "tfa98xx-aif-2-36";
+-
+-                dev_info(dev, "%s: dual speaker configured (34 & 36)\n", __func__);
++				/*
++				 * EEBBK S6 (P20H130 / sdmmagpiep): the two speaker
++				 * amplifiers on i2c 2-0034 and 2-0036 are AWINIC
++				 * AW882xx parts, not TFA98xx.  The aw882xx driver
++				 * probes both (dmesg: "[Awinic][2-0034]aw882xx
++				 * 1852 detected") and registers the DAIs
++				 * "aw882xx-aif-2-34" / "aw882xx-aif-2-36" with the
++				 * components "aw882xx_smartpa.2-0034" /
++				 * "aw882xx_smartpa.2-0036".
++				 *
++				 * The previous code forced the legacy single-codec
++				 * fields to "tfa98xx*" here.  That makes
++				 * snd_soc_init_multicodec() collapse each link to one
++				 * codec (num_codecs = 1) pointing at a DAI that does
++				 * not exist on this board, so
++				 * snd_soc_register_card() returns -EPROBE_DEFER
++				 * forever:
++				 *   "ASoC: CODEC DAI tfa98xx-aif-2-34 not registered"
++				 * No sound card is ever created, the vendor audio HAL
++				 * dies in get_sndcard_id(), audioserver never
++				 * publishes media.audio_policy and the device hangs on
++				 * the boot animation.
++				 *
++				 * Leave the legacy fields NULL and let the link table
++				 * above supply the AW882xx components
++				 * (.codecs = awinic_codecs, .num_codecs = 2 under
++				 * CONFIG_SND_SOC_AWINIC_AW882XX) - this is what the
++				 * factory machine_dlkm.ko does (its symbol table has
++				 * "aw882xx_dails", 48 bytes = 2 dai_link_components).
++				 */
++				dev_info(dev, "%s: dual AW882xx speakers configured (2-0034 & 2-0036)\n",
++					 __func__);
+ 
+ 				memcpy(msm_sm6150_dai_links + total_links,
+ 					msm_mi2s_be_dai_links,
+# 02-audio-techpack
+#
+# 音频：把 techpack 音频栈与 ADSP loader 编进内核、机驱动换 AW882xx、功放启动与寄存器表、32bit、VI feedback mux
+#
+# 由 git diff 525066d92..HEAD -- <下列路径> 生成：
+#   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_l.bin
+#   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_r.bin
+#   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_l.bin
+#   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_r.bin
+#   techpack/audio/asoc/codecs/awinic/inc/aw_device.h
+#   techpack/audio/asoc/codecs/awinic/src/aw882xx.c
+#   techpack/audio/asoc/codecs/awinic/src/aw_device.c
+#   techpack/audio/asoc/msm-dai-q6-v2.c
+#   techpack/audio/asoc/msm-pcm-routing-v2.c
+#   techpack/audio/asoc/sm6150.c
+

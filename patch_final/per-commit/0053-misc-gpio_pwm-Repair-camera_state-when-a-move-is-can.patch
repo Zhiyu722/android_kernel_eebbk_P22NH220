@@ -1,0 +1,103 @@
+From e368c0e7461883c06d898dbd979f34c29026add4 Mon Sep 17 00:00:00 2001
+From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 19:29:04 +0800
+Subject: [PATCH 53/67] misc: gpio_pwm: Repair camera_state when a move is
+ cancelled
+
+camera_state 4 and 5 mean "moving", and vib_pwm_move_to() refuses every later
+request while it holds one of them.  Two paths cancelled a move without putting
+the state back:
+
+  * cancel_vib_hrtimer() finishes with keep_state = true and only sets ABNORMAL
+    for arg == 0.  The vendor can leave it busy because its closed loop mover
+    writes the real state immediately afterwards; nothing does that here, so a
+    single cancel left the driver refusing all moves - the elevator stopped half
+    way and the camera never came out again, while BBK's camera service waited
+    for vib_is_move() to settle.
+  * vib_pwm_enable_store() cancelled the timer for any value other than 1 or 2
+    and then only braked.
+
+Repair the state in both paths, and in vib_pwm_move_to() treat a busy state with
+no timer armed and no move in flight as stale rather than refusing for ever.
+
+Signed-off-by: Zhiyu722 <Zhiyu722@users.noreply.github.com>
+---
+ drivers/misc/gpio_pwm.c | 50 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/gpio_pwm.c b/drivers/misc/gpio_pwm.c
+index 30a174d0d..a22b1f8b8 100755
+--- a/drivers/misc/gpio_pwm.c
++++ b/drivers/misc/gpio_pwm.c
+@@ -618,12 +618,29 @@ static int vib_pwm_move_to(struct vib_pwm *d, int want)
+ {
+ 	int cur = d->camera_state;
+ 
+-	/* states 4 and 5 are busy, and a calibration blocks a move */
++	/*
++	 * States 4 and 5 are busy, and a calibration blocks a move.  A busy
++	 * state with no timer armed and no move in flight is stale: some path
++	 * cancelled the move without its finish (the enable attribute, or
++	 * cancel_vib_hrtimer() below, which the vendor only repairs through the
++	 * closed loop mover that this kernel does not implement).  Left alone it
++	 * refuses every later request for ever, which is how the elevator ends
++	 * up stuck half way with BBK's camera service waiting for it.  Fall back
++	 * to the position the last finished move reached.
++	 */
+ 	if ((cur & ~1) == CAM_STATE_BUSY_UP || d->is_in_cali) {
+-		dev_info(d->dev,
+-			 "%s: want %d, current %d, is_in_cali %d: busy, ignored\n",
+-			 __func__, want, cur, d->is_in_cali);
+-		return 0;
++		if (!d->is_in_cali && !d->is_move && !hrtimer_active(&d->timer)) {
++			dev_info(d->dev,
++				 "%s: stale busy state %d, treating it as %d\n",
++				 __func__, cur, d->target_state);
++			d->camera_state = d->target_state;
++			cur = d->camera_state;
++		} else {
++			dev_info(d->dev,
++				 "%s: want %d, current %d, is_in_cali %d: busy, ignored\n",
++				 __func__, want, cur, d->is_in_cali);
++			return 0;
++		}
+ 	}
+ 
+ 	if (cur == want)
+@@ -713,6 +730,17 @@ void cancel_vib_hrtimer(int arg)
+ 	if (arg == 0) {
+ 		d->camera_state = CAM_STATE_ABNORMAL;
+ 		dev_info(d->dev, "---------only_stop_vib & not do anything, camera_state:6 ----\n");
++	} else if ((d->camera_state & ~1) == CAM_STATE_BUSY_UP) {
++		/*
++		 * The vendor leaves the busy state here because its closed loop
++		 * mover writes the real one immediately afterwards.  Nothing
++		 * does that in this kernel, so repair it now: a camera_state of
++		 * 4 or 5 blocks every later move.
++		 */
++		d->camera_state = d->target_state;
++		dev_info(d->dev,
++			 "%s: repaired camera_state %d after the cancel\n",
++			 __func__, d->camera_state);
+ 	}
+ 	wake_up_interruptible(&d->wait);
+ }
+@@ -826,6 +854,18 @@ static ssize_t vib_pwm_enable_store(struct device *dev, struct device_attribute
+ 	if (d->enable == 0) {
+ 		hrtimer_cancel(&d->timer);
+ 		cancel_work_sync(&d->finish_work);
++		/*
++		 * Stop the electrical part here and leave a state that later
++		 * moves are not refused from; vib_pwm_set_camera_state() below
++		 * only brakes and never touches camera_state.
++		 */
++		vib_pwm_motor_down(d);
++		if ((d->camera_state & ~1) == CAM_STATE_BUSY_UP) {
++			d->camera_state = d->target_state;
++			dev_info(d->dev,
++				 "%s: repaired camera_state %d after the cancel\n",
++				 __func__, d->camera_state);
++		}
+ 	}
+ 	vib_pwm_set_camera_state(d);
+ 	mutex_unlock(&d->lock);
