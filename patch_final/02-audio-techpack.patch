@@ -1,3 +1,51 @@
+diff --git a/firmware/aw882xx_rcv_reg_l.bin b/firmware/aw882xx_rcv_reg_l.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..6464c45502943d1be1dcc5a95fd4a7dc5b0a92d1
+GIT binary patch
+literal 148
+zcmV~$y$-=p0D#f2KeY7H1&OU)SUXxI9Xx<25*B|&vFK=$GzO1xM{l8t#BP&Vj7%P(
+z&e6F3bka_aFL^!{gIF^$-2$dj#KYpP2trD{WSLsihKYkh3!g5D+T-p7__9wu8}MYv
+t#Tg+OgFD3%GY;CEhrYmWgxso2lJ*MYxJD&H^)^U-OC)!k&U?sWQvP%7AG`nn
+
+literal 0
+HcmV?d00001
+
+diff --git a/firmware/aw882xx_rcv_reg_r.bin b/firmware/aw882xx_rcv_reg_r.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..1a2f45b1dd1bc20e0d36178f730f0ad80ea11f57
+GIT binary patch
+literal 148
+zcmV~$yAHun0D$4Y7g}065w_EXwWCGShzF3mBrI-4u@I9<(il9(c@s?}cALavWbz30
+zeHz!FPSVcsCCjH`aL`OlH-~BD@vwL+HX#LGvPik^z*wNrz^6m32HZs#U-qb`eVz<x
+ti6J&4a3@&yl%qD|q0ez@A-B?kxVgkQtx$<jy){zb5Xmj)%MQ{#34dI;A6x(c
+
+literal 0
+HcmV?d00001
+
+diff --git a/firmware/aw882xx_spk_reg_l.bin b/firmware/aw882xx_spk_reg_l.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..f026ba720938c411eebc0af0d87ff8723f415281
+GIT binary patch
+literal 148
+zcmV~$yAHu%0D#f27g}065w><AwvG&v4j!O!OIVZ^#iFB0(il9(KY9xiiQOi#7;PS*
+z&QZAjRJ>k}7J0rkjYQGWodRB`h>O8TGKnbh7G<hU3uZPFZ328!xzEEM;E5siY{ZK(
+u7kh%q6r2FVoO1{lJk=1Z5pl09NxLhw;~JS5+1()2EwR{fI`1J%xbX)Uavy2{
+
+literal 0
+HcmV?d00001
+
+diff --git a/firmware/aw882xx_spk_reg_r.bin b/firmware/aw882xx_spk_reg_r.bin
+new file mode 100755
+index 0000000000000000000000000000000000000000..ffd775d15b419d7c63cfb66442bdb9f6daa5267a
+GIT binary patch
+literal 148
+zcmV~$yAHu%0D#f27g}1nAhERzv2|pSG|~qUw}eG$Q7pt{k~9X7@xKX)#BP&Vj5d!@
+z=O|o%DxROAL6&bx<Dls1P7be?$Hm|ynM4$Liz1b}1ydV|CIMX%xyQrq<B0*)bjXVl
+u9ea$)1e^fFoN)~2Jk=1Z7I7~xNZL!Z(+Zgw*<B;l4YAmAzU&~~bK?*E2Ok0e
+
+literal 0
+HcmV?d00001
+
 diff --git a/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_l.bin b/techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_l.bin
 new file mode 100755
 index 0000000000000000000000000000000000000000..6464c45502943d1be1dcc5a95fd4a7dc5b0a92d1
@@ -357,9 +405,13 @@ index 40c031fab..dcdbe7734 100755
  					msm_mi2s_be_dai_links,
 # 02-audio-techpack
 #
-# 音频：把 techpack 音频栈与 ADSP loader 编进内核、机驱动换 AW882xx、功放启动与寄存器表、32bit、VI feedback mux
+# 音频：把 techpack 音频栈与 ADSP loader 编进内核、机驱动换 AW882xx、功放启动与寄存器表（含 firmware/*.bin）、32bit、VI feedback mux
 #
 # 由 git diff 525066d92..HEAD -- <下列路径> 生成：
+#   firmware/aw882xx_rcv_reg_l.bin
+#   firmware/aw882xx_rcv_reg_r.bin
+#   firmware/aw882xx_spk_reg_l.bin
+#   firmware/aw882xx_spk_reg_r.bin
 #   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_l.bin
 #   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_rcv_reg_r.bin
 #   techpack/audio/asoc/codecs/awinic/firmware/aw882xx_spk_reg_l.bin

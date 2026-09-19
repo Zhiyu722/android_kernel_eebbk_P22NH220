@@ -1533,10 +1533,10 @@ index 000000000..6e57ed090
 +  数据块 0x10 的解码此前已逆向；驱动 `mxm1120` 目前刻意留在 standby。
 diff --git a/README.md b/README.md
 new file mode 100755
-index 000000000..6145a5d21
+index 000000000..0b5e968ac
 --- /dev/null
 +++ b/README.md
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,127 @@
 +# EEBBK S6（P20H130 / sm6150 / sdmmagpiep）内核源码 —— 最终版
 +
 +| 项 | 值 |
@@ -1613,7 +1613,8 @@ index 000000000..6145a5d21
 +docs/vendor-mod-attempt.md         /vendor 瘦身尝试与回滚（未采用）
 +docs/bpf-gsi-feasibility.md        Android 15/16 GSI 的 BPF 可行性评估
 +tools/ksu/*.py                     KernelSU 集成的锚定脚本（钩子注入 / Kconfig 适配）
-+patch+++                           按主题拆分的补丁包 + 中文 README
++patch_final/                       最终补丁集：8 个主题补丁 + 67 个提交补丁 + 中文 README
++                                   （取代旧的 patch+++，见 patch_final/README.md）
 +```
 +
 +---
