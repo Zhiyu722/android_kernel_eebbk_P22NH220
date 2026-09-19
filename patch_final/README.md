@@ -16,10 +16,14 @@
 ### A. 主题补丁（推荐：8 个文件，按顺序打）
 
 ```sh
-cd <内核源码根>
-for p in patch_final/0*.patch; do patch -p1 < "$p"; done      # 或
+cd <内核源码根>            # 需要是一个 git 仓库（git apply 也用于校验二进制补丁）
 git apply patch_final/0*.patch
 ```
+
+> ⚠️ 请用 `git apply`。`01`、`03`~`08` 用 `patch -p1` 也能打，但 **`02-audio-techpack.patch` 里带
+> 4+4 个 aw882xx 寄存器表 `.bin`（二进制补丁）**，`patch -p1` 处理不了 git 的二进制补丁格式；
+> 没有 `git` 时请手动把那 8 个文件（`firmware/` 与
+> `techpack/audio/asoc/codecs/awinic/firmware/`）拷进去，再打其余的补丁。
 
 | 顺序 | 补丁 | 内容 | 文件数 | 详见 |
 |---|---|---|---|---|

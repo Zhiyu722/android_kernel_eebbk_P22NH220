@@ -1,7 +1,7 @@
 From 4aae9625b041e21a1e9ac1524f190d56b055b217 Mon Sep 17 00:00:00 2001
 From: Zhiyu722 <Zhiyu722@users.noreply.github.com>
 Date: Sat, 19 Sep 2026 17:06:05 +0800
-Subject: [PATCH 69/70] patch: actually track the patch files of patch_final
+Subject: [PATCH 69/71] patch: actually track the patch files of patch_final
 
 The kernel .gitignore has a "*.patch" rule, so the previous commit only added
 patch_final/README.md.  Force-add the eight topic patches, the 67 per-commit
