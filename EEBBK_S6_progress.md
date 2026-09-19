@@ -491,3 +491,40 @@ up 0: ... gp2_clk rate=32000 ... enabled=1 parent_rate=32000 boost=1 en=0 sleep=
 | `dist/boot_release.img` | 正式版：全部修复，关闭 bring-up 调试 | `df22126716c7b7831fb91f41fa330a53` |
 | `dist/boot_cam11.img` | 调试版（#30），升降即在此版验证 | `92bf1cf3c19978ebd36dad06c5792d17` |
 | `patch+++/` | 全部补丁合并整理（含 README 索引） | — |
+
+---
+
+## 2026-09-19：通知声 / 锁屏提示音 / 升降下降凸起
+
+### 通知声
+- 实测轨道增益：故障时 `AF::Track: setFinalVolume:0.063096`（-24 dB），
+  因为扬声器的铃声/通知音量只有 3/15；媒体走 offload 通路所以不受影响。
+- 修复：`volume_ring_speaker` 提到 15 + 音量键 → 增益 0.39~1.0 → 默认短通知声
+  （pixiedust）每次都能听到（用户确认）。
+- 另一个状态问题：HAL 的 awinic VI feedback 启动失败（`pcm start for TX failed`）
+  → `iv_feedback_count` 泄漏 → `disable_snd_device(speaker)` 提前退出 → 扬声器路由卡死
+  → 所有声音全哑，**重启恢复**（用户确认）。
+
+### 锁屏提示音
+- `framework-res.apk` 的 `resources.arsc` 里 raw 类型只有 6 个条目，没有 lock/unlock；
+  锁屏音改从设置项取路径。写入 `global lock_sound` / `global unlock_sound` 指向
+  `/product/media/audio/ui/Lock.ogg` / `Unlock.ogg`，锁屏与解锁各产生一次 SoundPool 播放
+  （`0.126` / `0.309`）。
+
+### 升降下降凸起
+- `vib_pwm_move_to: want 0, current 1 -> down for 1941 ms`（与上升同长），
+  而原厂靠霍尔 `add_time` 重试补下降行程；本机霍尔 standby → 闭环失效 → 凸起。
+- 用 `/dev/bbk_hall_core` 的 `SET_CALI`(0x40046000) / `TRANS_CALI`(0x40046001)
+  把 `cali_time` 2790 → 3630（+30%），驱动时长 1941 → 2526 ms，
+  相机 App 实测降到底贴合、无凸起（用户确认）。
+- 工具：`patch+++/tools/elev.c`（静态 aarch64，已推到 `/data/local/tmp/elev`）。
+  回退：`elev set 2790`。
+
+### 内核重编卡开机（未查明）
+- 两次重编（增量 / 全新）都卡在开机画面，对照刷回 `boot_elev_dbg.img` 立即正常。
+- 已排除：config（内嵌逐行相同）、clang/LLD 版本、模块符号 CRC、源码差异（仅三处良性改动）。
+- 结论：升降补偿走校准方案，未验证的内核改动以 patch 形式保留、未合入。
+
+### 霍尔（下一步）
+- `bbk_hall_data = up:-2000 down:-2000`（无 DRDY），芯片 0035、ID 寄存器 0x09=0x9c、
+  数据块 0x10 的解码此前已逆向；驱动 `mxm1120` 目前刻意留在 standby。

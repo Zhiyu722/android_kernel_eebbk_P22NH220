@@ -606,3 +606,90 @@ bbk_hall_vendor
 设备树：`hall` 节点（`compatible="qcom,hall"`、GPIO93 中断）在 dtbo 覆盖层；
 `bbk_vib_pwm` 节点不在 `imgdata` 的 dtbo/boot DTB 里，说明设备上是原厂那份 dtbo
 —— **不要刷用本仓库编译的 dtbo，否则 hall/vib 节点会丢**。
+
+---
+
+## 九、通知声 / 锁屏提示音 / 升降下降凸起（2026-09-19 补充）
+
+本节针对真机上另外三个问题，全部实测确认；本节结论**不涉及本仓库源码改动**
+（升降下降那条走的是原厂校准接口），因此仓库里的 `drivers/misc/gpio_pwm.c` 保持原样。
+
+### 1. 通知声没有（已修复）
+
+通知走 **混音通路**（`AudioOut_D`，`AUDIO_OUTPUT_FLAG_PRIMARY|FAST`），媒体走
+**offload 直通 DSP** 通路（`usecase(3: compress-offload-playback)`），两者音量互不影响，
+所以会出现“媒体一直正常、只有通知不响”。
+
+| 现象 | 证据（真机） | 处理 |
+|---|---|---|
+| 扬声器的铃声/通知音量只有 3/15 | `AF::Track: setFinalVolume:0.063096`（≈ -24 dB） | `settings put system volume_ring_speaker 15` + 音量键，增益升到 `0.39~1.0` |
+| 用久了所有声音全哑（含媒体） | HAL 的 awinic VI feedback 每次启动都失败：`pcm start for TX failed` → `iv_feedback_count = 2, can't stop feedback!`；内核对应 `SM6150 ASM Loopback: ASoC: no backend DAIs enabled` | 重启即恢复（已实测）；根治见第 4 条 |
+
+### 2. 锁屏提示音没有（已修复）
+
+该 ROM 的锁屏音取自设置项里的**文件路径**，为空时回退到 framework 中并不存在的
+`R.raw.lock`（解析 `framework-res.apk` 的 `resources.arsc` 可确认 raw 类型只有
+loaderror / nodomain / color_fade_* / fallback_categories / fallbackring 六个条目）。
+
+```bash
+settings put global lock_sound   /product/media/audio/ui/Lock.ogg
+settings put global unlock_sound /product/media/audio/ui/Unlock.ogg
+```
+
+`/product/media/audio/ui/` 里本就有完整的 Lock.ogg / Unlock.ogg；`/system/media/audio/ui/`
+只剩 3 个文件，所以截屏声正常而锁屏声缺失。实测锁屏、解锁各产生一次 SoundPool 播放
+（`setFinalVolume 0.126` / `0.309`）。
+
+### 3. 升降前摄降到底后仍有明显凸起（已修复）
+
+机制：驱动按 `all_time`（校准里的 `cali_time`）开环驱动，应用请求 `MID→DOWN` 时
+下降时长与上升相同：
+
+```
+vib_pwm_move_to: want 1, current 0 -> up for 1941 ms, retry 3
+vib_pwm_move_to: want 0, current 1 -> down for 1941 ms, retry 3
+```
+
+实际驱动时间 = `time_ms × 6/10`（`VIB_PWM_MOVE_NUM/DEN`，19200 Hz 标称值折算到 32000 Hz）。
+原厂靠霍尔闭环（`add_time` 重试）补上下降行程，而本机霍尔一直 standby
+（`bbk_hall_data = up:-2000 down:-2000`），闭环失效 → 每次下降都差一截。
+
+**修法（不改内核、不刷机）**：`/dev/bbk_hall_core` 是 0666 的 misc 设备，其 ioctl 会把
+56 字节校准结构体拷进内核并调用 `set_vib_all_time()`：
+
+| ioctl | 作用 |
+|---|---|
+| `0x40046000` `BBK_HALL_CORE_IOCTL_SET_CALI` | 写入并持久化到 `/mnt/vendor/persist/sensors/cali_hall` |
+| `0x40046001` `BBK_HALL_CORE_IOCTL_TRANS_CALI` | 只改内存（重启还原，适合试值） |
+
+`struct hall_cali_data` 共 56 字节，`int cali_time` 位于 `+0x34`。
+工具源码见 `patch+++/tools/elev.c`，静态 aarch64 二进制随交付。
+
+```bash
+adb push elev /data/local/tmp/elev && adb shell chmod 755 /data/local/tmp/elev
+adb shell /data/local/tmp/elev trans 3630   # 试值：重启还原
+adb shell /data/local/tmp/elev set   3630   # 定值：写入 persist，重启保持
+```
+
+**采用值：`cali_time` 2790 → 3630（+30%）**，实测升降时长 1941 → 2526 ms，
+相机 App 升起→退出后**降到底贴合、无凸起**，升起高度正常。回退：
+`/data/local/tmp/elev set 2790`。
+
+> 注意：用 sysfs 直接写 `vib_pwm_camera_state` 与相机 App 的真实流程结果不同，
+> 只有直接写 sysfs 时会看到凸起；以相机 App 的实测为准。
+
+### 4. 未完成项与风险
+
+* **awinic VI feedback / `SM6150 ASM Loopback` 无后端 DAI 未根治**：这是“用久了全哑”的
+  根源。HAL（`/vendor/lib64/hw/audio.primary.sm6150.so`）里的
+  `audio_extn_aw882xx_start_feedback` 用 `msm-pcm-loopback`（MultiMedia6）做 VI feedback，
+  该 FE 没有后端 DAI 导致 `pcm start for TX failed`。根治方向：给该 FE 配后端 DAI，
+  或在 HAL 侧关掉 feedback（该库含 `vendor.audio.feature.dsm_feedback.enable` 等字符串）。
+* **内核重编后两次卡开机**（原因未查明）：两次分别用“增量重编”和“删除 out_native 全新编译”
+  构建，均卡在开机画面（USB 不枚举），对照刷回旧镜像立刻正常。已排除：编译配置
+  （内嵌 `.config` 逐行相同）、编译器（clang 11.1.0-6 / LLD 11.1.0）、链接器、模块兼容性
+  （`wlan.ko` 的 387 个符号 CRC 与新版 `Module.symvers` 全部一致）、源码差异
+  （仅 `gpio_pwm.c`/`kernel.h`/`module.c` 三处良性改动）。因此升降的下降补偿改用校准方案。
+  未验证的 `down_extra_permille` 改动保留为
+  `patch+++/optional-elevator-down-margin.patch`，**未合入**。
+* **霍尔仍 standby**（`up:-2000 down:-2000`），闭环未恢复。
