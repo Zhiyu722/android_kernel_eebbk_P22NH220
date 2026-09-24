@@ -145,6 +145,41 @@ Number of camera devices: 2
 
 实测前置摄像头可以正常打开。
 
+### 10. **\`qcom-spmi-wled.c\`：4 路 LED 电流沉全开（修复亮度调不满/整体偏暗）**
+
+T3 的面板是 **4 串背光**，但 dtbo overlay（fragment@33）里写的是
+\`qcom,string-cfg = <3>\`。上游驱动把这个值当**位掩码**用：
+
+\`\`\`c
+for (i = 0; (string_cfg >> i) != 0; i++)
+	if (string_cfg & BIT(i)) { ...; sink_en |= 1 << (i + 4); }
+\`\`\`
+
+于是只使能了 sink1/sink2：
+
+| | string_cfg | sink_en | 结果 |
+|---|---|---|---|
+| 本仓库修改前 | 0x3 | **0x30**（4 路里只开 2 路） | 亮度只有约一半 |
+| 原厂内核 | 3 -> **15 (0xF)** | 0xF0（4 路全开） | 满亮度 |
+
+原厂内核对同一个 DT 值最终得到 0xF，也就是它把 \`qcom,string-cfg\` 当作
+**0 基的串数索引**（3 = 4 串），而不是掩码。按同样语义修正：
+
+\`\`\`c
+if (is_wled5(wled) && wled->cfg.string_cfg != 0xf) {
+	pr_err("WLED: T3FIX_STRINGS string-cfg 0x%x -> 0xf (4 LED strings)", ...);
+	wled->cfg.string_cfg = 0xf;
+}
+\`\`\`
+
+实机验证（内核日志）：
+
+\`\`\`
+WLED: wled_configure: WLED: T3FIX_STRINGS string-cfg 0x3 -> 0xf (4 LED strings)
+\`\`\`
+
+用户实测：**最大亮度明显提升，与原厂相当**。
+
 ## 验证结果（T3 实机）
 
 | 项目 | 结果 |
