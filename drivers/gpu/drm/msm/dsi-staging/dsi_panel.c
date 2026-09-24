@@ -24,6 +24,21 @@
 #include "dsi_ctrl_hw.h"
 #include "dsi_parser.h"
 
+/*
+ * EEBBK T3 / P22NH220: the focaltech touch controller has no supply of its own
+ * in the device tree - it is powered from the same "vddio" rail as the panel.
+ * The factory kernel therefore refuses to power that rail down while the BBK
+ * touch gesture switch (double click to wake) is enabled: its "close vddio"
+ * helper bails out as soon as the touch driver reports the gesture flag,
+ * because the touch IC has to keep running - and keep the i2c bus alive - to
+ * detect the double tap on a dark screen.  Powering vddio off here kills the
+ * touch controller on every screen off, and every later i2c access to it then
+ * fails with "i2c_geni a84000.i2c: i2c error :-110".
+ */
+extern int get_tp_gesture_flag(void);
+
+static bool dsi_panel_vddio_held;
+
 /**
  * topology is currently defined by a set of following 3 values:
  * 1. num of layer mixers
@@ -431,6 +446,36 @@ static int dsi_panel_set_pinctrl_state(struct dsi_panel *panel, bool enable)
 }
 
 
+/*
+ * Take (or release) an extra reference on the panel "vddio" rail.  While the
+ * reference is held the rail stays powered even though the panel's own
+ * regulator list is switched off, which is what keeps the touch controller
+ * alive for double click to wake.  See get_tp_gesture_flag() above.
+ */
+static void dsi_panel_hold_vddio(struct dsi_panel *panel, bool hold)
+{
+	struct dsi_regulator_info *regs = &panel->power_info;
+	int i;
+
+	for (i = 0; i < regs->count; i++) {
+		if (strcmp(regs->vregs[i].vreg_name, "vddio"))
+			continue;
+
+		if (hold && !dsi_panel_vddio_held) {
+			if (!regulator_enable(regs->vregs[i].vreg))
+				dsi_panel_vddio_held = true;
+			else
+				pr_err("[%s] failed to keep vddio on\n",
+				       panel->name);
+		} else if (!hold && dsi_panel_vddio_held) {
+			regulator_disable(regs->vregs[i].vreg);
+			dsi_panel_vddio_held = false;
+		}
+
+		return;
+	}
+}
+
 static int dsi_panel_power_on(struct dsi_panel *panel)
 {
 	int rc = 0;
@@ -440,6 +485,9 @@ static int dsi_panel_power_on(struct dsi_panel *panel)
 		pr_err("[%s] failed to enable vregs, rc=%d\n", panel->name, rc);
 		goto exit;
 	}
+
+	/* panel regulators are back, drop the gesture hold on vddio */
+	dsi_panel_hold_vddio(panel, false);
 
 	rc = dsi_panel_set_pinctrl_state(panel, true);
 	if (rc) {
@@ -489,6 +537,11 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 		pr_err("[%s] failed set pinctrl state, rc=%d\n", panel->name,
 		       rc);
 	}
+
+	/* keep the shared vddio rail alive for the touch controller while the
+	 * BBK gesture switch (double click to wake) is enabled */
+	if (get_tp_gesture_flag())
+		dsi_panel_hold_vddio(panel, true);
 
 	rc = dsi_pwr_enable_regulator(&panel->power_info, false);
 	if (rc)

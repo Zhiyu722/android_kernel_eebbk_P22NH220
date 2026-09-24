@@ -248,6 +248,9 @@ int fts_bus_init(struct fts_ts_data *ts_data);
 int fts_bus_exit(struct fts_ts_data *ts_data);
 
 /* Gesture functions */
+/* BBK touch gesture switch state, read by the display driver before it powers
+ * the shared vddio rail down */
+int get_tp_gesture_flag(void);
 int fts_gesture_init(struct fts_ts_data *ts_data);
 int fts_gesture_exit(struct fts_ts_data *ts_data);
 void fts_gesture_recovery(struct fts_ts_data *ts_data);

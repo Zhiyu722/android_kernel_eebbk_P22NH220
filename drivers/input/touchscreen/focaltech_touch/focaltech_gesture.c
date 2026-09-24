@@ -33,6 +33,7 @@
 * 1.Included header files
 *****************************************************************************/
 #include "focaltech_core.h"
+#include <linux/kobject.h>
 
 /******************************************************************************
 * Private constant and macro definitions using #define
@@ -47,8 +48,16 @@
 #define KEY_GESTURE_M                           KEY_M
 #define KEY_GESTURE_L                           KEY_L
 #define KEY_GESTURE_W                           KEY_W
-#define KEY_GESTURE_S                           KEY_S
-#define KEY_GESTURE_V                           KEY_V
+/* EEBBK T3 / P22NH220: the ROM keylayout
+ * (/system/usr/keylayout/Generic.kl, "#add by litong" block) maps the vendor
+ * gesture scan codes 712/713/715 to GESTURE_S / GESTURE_V /
+ * GESTURE_DOUBLE_CLICK, and the BBK framework (wake lock tag
+ * "android.policy:GESTURE") turns the screen on for GESTURE_DOUBLE_CLICK.
+ * The driver therefore has to report the same scan codes as the factory
+ * kernel, otherwise double click to wake is never recognised. */
+#define KEY_GESTURE_S                           712
+#define KEY_GESTURE_V                           713
+#define KEY_GESTURE_DOUBLE_CLICK                715
 #define KEY_GESTURE_C                           KEY_C
 #define KEY_GESTURE_Z                           KEY_Z
 
@@ -193,6 +202,76 @@ static struct attribute_group fts_gesture_group = {
     .attrs = fts_gesture_mode_attrs,
 };
 
+/*****************************************************************************
+* BBK touch gesture switch  (/sys/touchscreen/gestureflag)
+*
+* The P22NH220 ROM ships /vendor/etc/init/hw/init.target.rc with
+*     chmod 0664 /sys/touchscreen/gestureflag
+*     chown system system /sys/touchscreen/gestureflag
+* and the BBK framework/StudyOS service pushes the user setting
+* Settings.System."screen_double_click_to_wakeup" into that node.  The factory
+* focaltech driver creates it (kobject "touchscreen" + attribute
+* "gestureflag", mode 0644, simple_strtoul() input, value 1 == enable), so
+* without this node double click to wake cannot be switched on at all and the
+* touch IC never enters gesture mode.  Keep the very same interface here.
+*****************************************************************************/
+static struct kobject *fts_tp_kobj = NULL;
+
+static ssize_t tp_gesture_flag_show(
+    struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct fts_ts_data *ts_data = fts_data;
+
+    return snprintf(buf, PAGE_SIZE, "%d\n",
+                    ts_data->gesture_mode ? 1 : 0);
+}
+
+static ssize_t tp_gesture_flag_store(
+    struct device *dev,
+    struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct fts_ts_data *ts_data = fts_data;
+    unsigned long val = 0;
+
+    val = simple_strtoul(buf, NULL, 10);
+    ts_data->gesture_mode = (val == 1) ? ENABLE : DISABLE;
+    FTS_INFO("hgc->set_gesture == %d", ts_data->gesture_mode);
+
+    return count;
+}
+
+static DEVICE_ATTR(gestureflag, 0644, tp_gesture_flag_show,
+                   tp_gesture_flag_store);
+
+static int fts_create_tp_gesture_sysfs(void)
+{
+    fts_tp_kobj = kobject_create_and_add("touchscreen", NULL);
+    if (!fts_tp_kobj) {
+        FTS_ERROR("sysfs_create_gesture_file failed");
+        return -ENOMEM;
+    }
+
+    if (sysfs_create_file(fts_tp_kobj, &dev_attr_gestureflag.attr)) {
+        FTS_ERROR("sysfs_create_gesture_file failed");
+        kobject_put(fts_tp_kobj);
+        fts_tp_kobj = NULL;
+        return -ENODEV;
+    }
+
+    FTS_INFO("sysfs create gesture success!");
+    return 0;
+}
+
+static void fts_remove_tp_gesture_sysfs(void)
+{
+    if (!fts_tp_kobj)
+        return;
+
+    sysfs_remove_file(fts_tp_kobj, &dev_attr_gestureflag.attr);
+    kobject_put(fts_tp_kobj);
+    fts_tp_kobj = NULL;
+}
+
 static int fts_create_gesture_sysfs(struct device *dev)
 {
     int ret = 0;
@@ -226,7 +305,7 @@ static void fts_gesture_report(struct input_dev *input_dev, int gesture_id)
         gesture = KEY_GESTURE_DOWN;
         break;
     case GESTURE_DOUBLECLICK:
-        gesture = KEY_GESTURE_U;
+        gesture = KEY_GESTURE_DOUBLE_CLICK;
         break;
     case GESTURE_O:
         gesture = KEY_GESTURE_O;
@@ -413,6 +492,7 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
     FTS_FUNC_ENTER();
     input_set_capability(input_dev, EV_KEY, KEY_POWER);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_U);
+    input_set_capability(input_dev, EV_KEY, KEY_GESTURE_DOUBLE_CLICK);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_UP);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_DOWN);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_LEFT);
@@ -441,11 +521,15 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
     __set_bit(KEY_GESTURE_V, input_dev->keybit);
     __set_bit(KEY_GESTURE_C, input_dev->keybit);
     __set_bit(KEY_GESTURE_Z, input_dev->keybit);
+    __set_bit(KEY_GESTURE_DOUBLE_CLICK, input_dev->keybit);
 
     fts_create_gesture_sysfs(ts_data->dev);
+    fts_create_tp_gesture_sysfs();
 
     memset(&fts_gesture_data, 0, sizeof(struct fts_gesture_st));
-    ts_data->gesture_mode = FTS_GESTURE_EN;
+    /* gesture is off until the BBK switch (/sys/touchscreen/gestureflag,
+     * i.e. Settings.System."screen_double_click_to_wakeup") turns it on */
+    ts_data->gesture_mode = DISABLE;
 
     FTS_FUNC_EXIT();
     return 0;
@@ -454,7 +538,25 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
 int fts_gesture_exit(struct fts_ts_data *ts_data)
 {
     FTS_FUNC_ENTER();
+    fts_remove_tp_gesture_sysfs();
     sysfs_remove_group(&ts_data->dev->kobj, &fts_gesture_group);
     FTS_FUNC_EXIT();
     return 0;
 }
+
+/*
+ * EEBBK T3 / P22NH220: the touch controller is fed from the same vddio rail
+ * as the panel, so the display driver has to know whether the BBK gesture
+ * switch is on before it powers that rail down (the factory kernel exports
+ * the very same symbol and its "close vddio" path bails out when it is set).
+ */
+int get_tp_gesture_flag(void)
+{
+    struct fts_ts_data *ts_data = fts_data;
+
+    if (!ts_data)
+        return 0;
+
+    return ts_data->gesture_mode ? 1 : 0;
+}
+EXPORT_SYMBOL(get_tp_gesture_flag);
