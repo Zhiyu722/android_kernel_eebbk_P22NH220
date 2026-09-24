@@ -108,6 +108,43 @@ ADSP 对本树的 `AFE_PARAM_ID_TFADSP_RX_CFG` 返回 EBADPARAM
 改成 `force=1` 后会走 `tfaRunColdStartup()` -> `tfaRunStartup()` +
 `tfaRunColdboot(tfa,1)`（置 ACS）+ `tfaRunStartDSP()`，与原厂行为一致。
 
+### 9. **\`cam_eeprom_dev.c\`：前置摄像头模组识别修正（修复前摄打不开）**
+
+T3 的 CamX HAL 只带这些前摄资源：
+
+\`\`\`
+/vendor/lib64/camera/com.qti.sensor.ov8856.so
+/vendor/lib64/camera/com.qti.sensormodule.tsp_ov8856.bin
+/vendor/lib64/camera/com.qti.eeprom.tsp_p24c64g_ov8856.so
+\`\`\`
+
+也就是前摄是 **OmniVision OV8856**。CamX 会读内核导出的
+\`/proc/driver/FrontCamera_info\`，把里面的 "Module Vendor / Image Sensor"
+拿去和 \`com.qti.sensormodule.*.bin\` 逐个比对：
+
+| 内核 | FrontCamera_info | 结果 |
+|---|---|---|
+| 原厂 | \`Module Vendor: TSP, Image Sensor: OmniVision ov8856(8M)...\` | ✅ 匹配 \`tsp_ov8856.bin\` |
+| 本仓库修改前 | \`Module Vendor: TSP, Image Sensor: OmniVision ov16a10(16M)...\` | ❌ 所有 bin 都 "check module vendor failed" |
+
+匹配全部失败 → CamX 不创建前摄 → \`dumpsys media.camera\` 里
+\`Number of camera devices: 1\`（只有后摄）。
+
+修改 \`techpack\` 路径下的
+\`drivers/media/platform/msm/camera/cam_sensor_module/cam_eeprom/cam_eeprom_dev.c\`：
+新增 \`BBK_FRONT_OV8856()\`，把 TSP 前摄模组的分支从 ov16a10 改为 **ov8856**
+（\`buf[1] == 0x0a\` 的 TSP 分支、以及 len 不足时的 TSP 兜底分支）。
+
+修复后：
+
+\`\`\`
+Number of camera devices: 2
+    Device 0 maps to "0"   Facing: Back   Orientation: 90
+    Device 1 maps to "1"   Facing: Front  Orientation: 270
+\`\`\`
+
+实测前置摄像头可以正常打开。
+
 ## 验证结果（T3 实机）
 
 | 项目 | 结果 |
@@ -117,6 +154,7 @@ ADSP 对本树的 `AFE_PARAM_ID_TFADSP_RX_CFG` 返回 EBADPARAM
 | 音频 | 连续多次播放日志全部 `coldstart`（10 次 cold / 0 次 warm），**声音正常且持续** |
 | 显示 | 面板点亮、无 ESD 复位；`/sys/class/backlight/` 下 `backlight` 与 `panel0-backlight` 都在 |
 | 触摸 | FocalTech FT 正常 |
+| 摄像头 | 后摄 + **前摄** 均被枚举（Device0 Back/90°, Device1 Front/270°），前摄实测可打开 |
 | Wi-Fi | `qca_cld3` in-tree 驱动可连 5GHz |
 | dmesg | 无 `Internal error` / `Kernel panic` |
 
